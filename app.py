@@ -31,12 +31,16 @@ if missing:
     st.error(f"Missing secrets: {', '.join(missing)} (Manage app → Settings → Secrets)")
     st.stop()
 
+# Initialize clients
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
 # ----------------------------
 # UI
 # ----------------------------
-prompt = st.text_area("Your Prompt", height=180)
-context = st.text_area("Optional Context", height=180)
-run = st.button("Run Nemexis (2 Models)")
+prompt = st.text_area("Your Prompt", height=180, placeholder="Paste your engineering+finance question here...")
+context = st.text_area("Optional Context", height=180, placeholder="Paste assumptions, numbers, excerpts…")
+run = st.button("Run Nemexis")
 
 # ----------------------------
 # Role Prompts
@@ -45,33 +49,32 @@ ROLE_SYSTEMS = {
     "Technical Reviewer": (
         "You are a senior engineering reviewer. Challenge assumptions, identify failure modes, "
         "spot missing constraints, and propose validation checks. "
-        "Output: (1) Key assumptions (2) Critical risks (3) What to verify (4) Improvements."
+        "Output clearly structured sections."
     ),
     "Finance Reviewer": (
         "You are a project finance reviewer. Show calculations step-by-step and include at least one sanity check. "
         "Quantify sensitivities and identify missing inputs. "
-        "Output: (1) Inputs used (2) Calculations (3) Sensitivities (4) Missing data (5) IC takeaways."
+        "Output clearly structured sections."
     ),
     "Risk Reviewer": (
         "You are a risk officer. Identify high-risk claims, uncertainty areas, and validation requirements. "
-        "Output: (1) Highest-risk claims (2) Confidence assessment (3) Mitigations (4) What would change your mind."
+        "Output clearly structured sections."
     ),
 }
 
 SYNTHESIS_SYSTEM = (
     "You are Nemexis Synthesizer. Combine all reviewer outputs into Version 2. "
-    "Preserve disagreements, list assumptions clearly, provide validation plan, "
+    "Preserve disagreements explicitly, list assumptions clearly, provide validation plan, "
     "and assign a confidence level (Low/Medium/High) with explanation."
 )
 
 # ----------------------------
-# Provider Calls
+# Model Call Functions
 # ----------------------------
 
 def call_openai(system, user_text):
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        resp = client.chat.completions.create(
+        resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system},
@@ -83,13 +86,12 @@ def call_openai(system, user_text):
     except Exception as e:
         return f"❌ OpenAI Error: {str(e)}"
 
+
 def call_claude(system, user_text):
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-        msg = client.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=1000,
+        msg = anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1200,
             temperature=0.2,
             system=system,
             messages=[
@@ -106,6 +108,7 @@ def call_claude(system, user_text):
 
     except Exception as e:
         return f"❌ Claude Error: {str(e)}"
+
 
 # ----------------------------
 # Execution
@@ -133,11 +136,11 @@ if run:
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("### OpenAI")
+            st.markdown("### OpenAI (gpt-4o-mini)")
             st.write(openai_out)
 
         with col2:
-            st.markdown("### Claude")
+            st.markdown("### Claude (Sonnet 4)")
             st.write(claude_out)
 
         all_outputs[role_name] = {

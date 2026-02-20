@@ -51,7 +51,7 @@ SYNTHESIS_SYSTEM = (
 
 def call_model(client: OpenAI, system: str, user_text: str) -> str:
     resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},

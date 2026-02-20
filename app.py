@@ -4,6 +4,13 @@ from openai import OpenAI
 
 st.set_page_config(page_title="Nemexis", layout="wide")
 st.title("Nemexis — Engineering + Finance Reliability Engine")
+# --- Simple password gate (MVP privacy) ---
+APP_PASSWORD = os.getenv("NEMEXIS_PASSWORD", "")
+
+if APP_PASSWORD:
+    entered = st.text_input("Password", type="password")
+    if entered != APP_PASSWORD:
+        st.stop()
 
 # Read key from Streamlit Cloud Secrets
 api_key = os.getenv("OPENAI_API_KEY", "").strip()

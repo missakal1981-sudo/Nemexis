@@ -13,7 +13,12 @@ if APP_PASSWORD:
         st.stop()
 
 # Read key from Streamlit Cloud Secrets
-api_key = os.getenv("OPENAI_API_KEY", "").strip()
+api_key = os.getenv("OPENAI_API_KEY", "")
+api_key = api_key.encode("ascii", "ignore").decode().strip()
+
+if not api_key:
+    st.error("API key not detected.")
+    st.stop()
 
 prompt = st.text_area("Your Prompt", height=180, placeholder="Paste your engineering+finance question here...")
 context = st.text_area("Optional Context", height=180, placeholder="Paste assumptions, numbers, excerpts…")

@@ -6,21 +6,23 @@ import requests
 import streamlit.components.v1 as components
 
 # ============================
-# Nemexis — Iterative Moderated Flow with Guardrails
+# Nemexis — Iterative Moderated Flow with Guardrails + Export
 # Master: OpenAI
 # Judges: Claude + Grok
 # Orbits: Engineering, Finance, Contract/Legal, Risk/Governance
 # Iterations: Rev 0 -> Critiques -> Rev 1 (+ Changelog)
-# Guardrails:
-#   1) Input Lock (verbatim "Inputs Used" section; no silent changes)
-#   2) Claims Audit (Computed / Estimated / Assumed / Unknown)
+# Guardrails (NEW):
+#   - Strict vs Bounding mode
+#   - Claims Audit enforcement (no "Computed" unless shown)
+#   - No numeric probabilities unless provided (Strict)
+#   - PPA fixed consistency rule
 # UX:
 #   - Copy all output button
 #   - Download markdown button
 # ============================
 
 st.set_page_config(page_title="Nemexis", layout="wide")
-st.title("Nemexis — Reliability Engine (Iterative Moderated Flow + Guardrails)")
+st.title("Nemexis — Reliability Engine (Iterative Moderated Flow + Guardrails v2)")
 
 # ----------------------------
 # Password Gate
@@ -57,7 +59,6 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # Copy-to-clipboard helper
 # ----------------------------
 def copy_to_clipboard_button(text: str, button_label: str = "📋 Copy all output"):
-    # Escape text for JS template literal
     safe = text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
     html = f"""
     <button id="copybtn" style="
@@ -110,10 +111,19 @@ grok_model = st.selectbox(
     index=0
 )
 
+mode = st.radio(
+    "Assumptions mode",
+    ["Strict (no numeric assumptions)", "Bounding (allow ranges + scenario)"],
+    index=0,
+    help="Strict = no invented numeric assumptions (O&M %, tax rate, CF, probabilities). Bounding = allowed but must be ranges + clearly labeled scenarios."
+)
+
 run = st.button("Run Nemexis (Rev 0 → Critiques → Rev 1)")
 
+STRICT_MODE = (mode.startswith("Strict"))
+
 # ----------------------------
-# Orbits (your day-to-day cast)
+# Orbits
 # ----------------------------
 ORBITS = [
     {
@@ -174,14 +184,34 @@ CLAIMS AUDIT (MANDATORY):
 - You MUST include a 'Claims Audit' section.
 - Every numeric claim you make must be tagged as one of:
   [Computed] [Estimated] [Assumed] [Unknown]
-- If you state an IRR range or DSCR result, you must tag it [Computed] AND show the calculation path.
+- "Computed" is ONLY allowed if you show the calculation path (enough for an analyst to replicate).
 - If you cannot compute, you must say so and tag as [Unknown] or [Estimated] with basis.
+- Do NOT label base case IRR as [Computed] unless you actually reproduce it from the cashflow logic you present.
+""".strip()
+
+PPA_CONSISTENCY_RULE = """
+PPA CONSISTENCY:
+- If the PPA is fixed price, do NOT list "PPA price volatility" as a risk unless you explicitly identify a repricing clause, merchant exposure, or volume/counterparty risk.
+""".strip()
+
+STRICT_MODE_RULE = """
+STRICT MODE:
+- You may NOT introduce any new numeric assumptions (tax rate, O&M %, capacity factor, probabilities, escalation rates, etc).
+- If required, list them as Unknown and request them under Missing Inputs.
+- You may provide directional conclusions, but must label them [Estimated] and explain the basis qualitatively.
+""".strip()
+
+BOUNDING_MODE_RULE = """
+BOUNDING MODE:
+- You may introduce numeric assumptions ONLY as ranges, with a scenario table (Low/Base/High).
+- Every added numeric assumption must be tagged [Assumed] with a short basis.
+- You must clearly separate Scenario Outputs from Facts.
 """.strip()
 
 NO_INVENTION_RULE = """
-NO INVENTED INPUTS:
-- Do not invent interest-only structures, tenors, DSCRs, CAPEX phasing, or EBITDA build-ups unless explicitly provided.
-- If you introduce a simplifying assumption, label it [Assumed] and explain why it is reasonable.
+NO INVENTED STRUCTURES:
+- Do not invent interest-only debt, change debt tenor, or ignore the construction period.
+- If debt is "sculpted to DSCR", do not claim a specific debt service schedule unless provided; instead, state what must be modeled and what DSCR implies.
 """.strip()
 
 # ----------------------------
@@ -192,14 +222,16 @@ MASTER_REV0_SYSTEM = (
     "Be conservative: do not overclaim. Strictly follow Input Lock and Claims Audit rules."
 )
 
-MASTER_REV0_OUTPUT_FORMAT = """
-Return Rev 0 in this exact structure:
+MASTER_OUTPUT_FORMAT = """
+Return in this exact structure:
 
 ## Inputs Used (Verbatim)
-- List user-provided inputs exactly as provided (numbers, terms, constraints)
+- List user-provided inputs exactly as provided
 
 ## Assumptions Added by Master
-- Only if needed; tag each [Assumed] and justify briefly
+- Only if needed
+- Tag each [Assumed] and justify briefly
+- In Strict mode: should usually be 'None' and instead list Unknowns
 
 ## Executive Answer
 - 5 bullets max; decision-oriented
@@ -207,21 +239,23 @@ Return Rev 0 in this exact structure:
 ## Calculations / Logic
 - Show key steps
 - Do NOT invent missing numbers
-- If missing inputs prevent computation, state that explicitly and tag [Unknown]
+- Respect construction period
+- Respect DSCR sculpting (do not fabricate a schedule)
+- If missing inputs prevent computation, state explicitly and tag [Unknown]
 
 ## Key Risks (ranked)
 - 5–10 bullets, ranked
 
 ## Contract / Legal Checks
-- Specific clauses/docs/questions (no generic fluff)
+- Specific clauses/docs/questions
 
 ## What to Validate Next
 - Concrete checks / documents / data
 
 ## Claims Audit
-- List the key numeric/quantitative claims you made, each tagged:
+- List key numeric/quantitative claims and tag:
   [Computed] [Estimated] [Assumed] [Unknown]
-  Include 1-line basis for each.
+  Include 1-line basis
 
 ## Confidence
 - Low / Medium / High + why
@@ -231,10 +265,10 @@ JUDGE_CRITIQUE_FORMAT = """
 Return critique in this structure (do not rewrite the whole answer):
 
 ## Summary Verdict
-- 1–3 bullets on overall quality
+- 1–3 bullets
 
 ## Critical Issues (must-fix)
-- Bullet list (short rationale)
+- Bullet list
 
 ## Corrections / Fixes
 - Specific edits/calculations to change
@@ -244,6 +278,12 @@ Return critique in this structure (do not rewrite the whole answer):
 
 ## Questions for the Team
 - Bullet list
+
+## Guardrail Violations Detected
+- Input Lock violations
+- Claims Audit violations
+- Invented numeric assumptions (especially in Strict mode)
+- PPA consistency issues
 
 ## Confidence in Master Draft
 - Low / Medium / High + why
@@ -265,7 +305,7 @@ Return in this exact structure:
 - Key edits applied: bullet list
 
 # Rev 1 (Updated Deliverable)
-(use the SAME structure as Rev 0, including Inputs Used (Verbatim), Assumptions Added by Master, and Claims Audit)
+(use the SAME structure as Rev 0)
 """.strip()
 
 # ----------------------------
@@ -329,6 +369,8 @@ if run:
     if context.strip():
         user_text += "\n\n---\nContext:\n" + context.strip()
 
+    mode_rules = STRICT_MODE_RULE if STRICT_MODE else BOUNDING_MODE_RULE
+
     st.divider()
     st.markdown("## Step 1 — Master Draft (Rev 0)")
 
@@ -337,8 +379,10 @@ if run:
             f"USER PROMPT:\n{user_text}\n\n"
             f"{INPUT_LOCK_RULES}\n\n"
             f"{CLAIMS_AUDIT_RULES}\n\n"
+            f"{PPA_CONSISTENCY_RULE}\n\n"
+            f"{mode_rules}\n\n"
             f"{NO_INVENTION_RULE}\n\n"
-            f"OUTPUT FORMAT:\n{MASTER_REV0_OUTPUT_FORMAT}"
+            f"OUTPUT FORMAT:\n{MASTER_OUTPUT_FORMAT}"
         )
         rev0 = call_openai(master_model, MASTER_REV0_SYSTEM, rev0_input)
 
@@ -359,13 +403,10 @@ if run:
         judge_input = (
             f"ORBIT:\n{orbit_name}\n\n"
             f"YOUR MANDATE:\n{mandate}\n\n"
-            f"IMPORTANT: You are critiquing the MASTER DRAFT. Do not rewrite it.\n\n"
+            f"IMPORTANT: Critique the MASTER DRAFT. Do not rewrite it.\n\n"
+            f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
             f"MASTER DRAFT (REV 0):\n{rev0}\n\n"
-            f"CRITIQUE FORMAT:\n{JUDGE_CRITIQUE_FORMAT}\n\n"
-            f"Also explicitly check for:\n"
-            f"- Violations of Input Lock (silent changed inputs)\n"
-            f"- Violations of Claims Audit (numbers stated without basis)\n"
-            f"- Invented assumptions presented as facts\n"
+            f"CRITIQUE FORMAT:\n{JUDGE_CRITIQUE_FORMAT}"
         )
 
         colA, colB = st.columns(2)
@@ -400,13 +441,16 @@ if run:
 
         rev1_input = (
             f"USER PROMPT:\n{user_text}\n\n"
+            f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
             f"{INPUT_LOCK_RULES}\n\n"
             f"{CLAIMS_AUDIT_RULES}\n\n"
+            f"{PPA_CONSISTENCY_RULE}\n\n"
+            f"{mode_rules}\n\n"
             f"{NO_INVENTION_RULE}\n\n"
             f"MASTER REV 0:\n{rev0}\n\n"
             f"CRITIQUES:\n{critique_blob}\n\n"
             f"OUTPUT FORMAT:\n{MASTER_REV1_OUTPUT_FORMAT}\n\n"
-            f"REMINDER: If you cannot compute a numeric claim, tag it [Unknown] and list missing inputs."
+            f"REMINDER: In Strict mode, do not add numeric assumptions—mark Unknown and request inputs."
         )
 
         rev1 = call_openai(master_model, MASTER_REV1_SYSTEM, rev1_input)
@@ -415,9 +459,12 @@ if run:
     st.write(rev1)
 
     # ----------------------------
-    # EXPORT BUNDLE (Copy + Download)
+    # EXPORT BUNDLE
     # ----------------------------
     export_text = f"""# Nemexis Export
+
+## MODE
+{'STRICT (no numeric assumptions)' if STRICT_MODE else 'BOUNDING (ranges + scenario)'}
 
 ## USER PROMPT
 {prompt.strip()}
@@ -468,9 +515,8 @@ if run:
     st.divider()
     st.markdown("## What you have now")
     st.markdown(
-        "- **Rev 0**: Master initial deliverable with Input Lock + Claims Audit\n"
-        "- **Orbit critiques**: Claude + Grok challenged Rev 0 across Engineering/Finance/Legal/Risk\n"
-        "- **Rev 1**: Master integrated critiques with explicit changelog + guardrails\n"
-        "- **Export**: One-click copy + download\n\n"
-        "Next upgrade (optional): run critics again on Rev 1 to produce Rev 2."
+        "- **Rev 0**: Master deliverable with strict guardrails\n"
+        "- **Orbit critiques**: Claude + Grok across Engineering/Finance/Legal/Risk\n"
+        "- **Rev 1**: Master integrated critiques + changelog\n"
+        "- **Export**: one-click copy + download\n"
     )

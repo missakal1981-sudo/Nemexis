@@ -7,7 +7,7 @@ import requests
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Nemexis", layout="wide")
-st.title("Nemexis — Reliability Engine (Iterative + Guardrails v4)")
+st.title("Nemexis — Reliability Engine (Iterative + Guardrails v5)")
 
 # ----------------------------
 # Password Gate
@@ -41,7 +41,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ----------------------------
-# Copy-to-clipboard helper
+# Copy helper
 # ----------------------------
 def copy_to_clipboard_button(text: str, button_label: str = "📋 Copy all output"):
     safe = text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
@@ -91,7 +91,6 @@ mode = st.radio(
     index=0,
 )
 STRICT_MODE = mode.startswith("Strict")
-
 run = st.button("Run Nemexis (Rev 0 → Critiques → Rev 1 → Auto-fix)")
 
 # ----------------------------
@@ -119,7 +118,7 @@ ORBITS = [
 ]
 
 # ----------------------------
-# Guardrail Rules
+# Guardrails
 # ----------------------------
 INPUT_LOCK_RULES = """
 INPUT LOCK:
@@ -143,16 +142,24 @@ PPA CONSISTENCY:
 
 CFADS_GUARDRAIL = """
 CFADS / DSCR GUARDRAIL (STRICT):
-- DSCR is calculated on CFADS (Cash Flow Available for Debt Service), NOT EBITDA.
-- If only EBITDA is provided, you must treat DSCR headroom and debt capacity as [Unknown] unless CFADS bridge is provided.
-- You may NOT compute 'max debt capacity' or 'debt service' from EBITDA/DSCR in Strict mode.
+- DSCR is based on CFADS, not EBITDA.
+- If only EBITDA is provided, DSCR headroom and debt capacity are [Unknown] unless a CFADS bridge is provided.
+- You may NOT compute debt service or max debt capacity from EBITDA/DSCR in Strict mode.
+""".strip()
+
+CAPITAL_STRUCTURE_GUARDRAIL = """
+CAPITAL STRUCTURE GUARDRAIL (STRICT):
+- In Strict mode, you may NOT assert post-overrun debt/equity funding as fact.
+- You MUST present 'Financing Treatment of Overrun' with two explicit cases:
+  Case A: Debt capped at base commitment; overrun equity-funded.
+  Case B: Debt upsized requires lender consent + CFADS/DSCR headroom (Unknown without model).
+- You may compute arithmetic (e.g., total CAPEX after overrun), but you must label funding mix as [Unknown] unless provided.
 """.strip()
 
 STRICT_RULES = """
 STRICT MODE:
-- You may NOT introduce new numeric assumptions (tax rate, O&M %, capacity factor, probabilities, escalation, etc.).
-- You may NOT introduce derived numeric outputs unless all required underlying inputs are explicitly provided.
-- Treat DSCR as a covenant/constraint, NOT a calculator for debt service or debt capacity.
+- No new numeric assumptions (tax rate, O&M %, capacity factor, probabilities, escalation, etc.).
+- No derived numeric outputs unless underlying inputs are explicitly provided.
 - If key decision metric cannot be computed, Confidence must be LOW.
 """.strip()
 
@@ -170,7 +177,7 @@ NO INVENTED STRUCTURES:
 """.strip()
 
 # ----------------------------
-# Output formats
+# Output format
 # ----------------------------
 MASTER_REV0_SYSTEM = "You are Nemexis Master (OpenAI). Produce Rev 0 that is decision-grade. Follow guardrails strictly."
 
@@ -181,6 +188,10 @@ Return in this exact structure:
 
 ## Assumptions Added by Master
 (Strict: usually None; instead list Unknowns)
+
+## Financing Treatment of Overrun (MANDATORY)
+- Case A (Debt capped): what becomes Unknown, what must be checked
+- Case B (Debt upsized): what becomes Unknown, what must be checked
 
 ## Executive Answer
 (5 bullets max)
@@ -228,7 +239,7 @@ Return:
 - Key edits applied
 
 # Rev 1 (Updated Deliverable)
-(use same structure as Rev 0)
+(use same structure as Rev 0, including Financing Treatment of Overrun)
 """.strip()
 
 GUARDRAIL_CHECK_SYSTEM = """
@@ -237,10 +248,12 @@ Detect violations of:
 - Strict mode rules (if strict)
 - Input Lock
 - Claims Audit (Computed without path)
-- DSCR misuse (EBITDA used as CFADS / EBITDA/DSCR)
+- DSCR misuse (EBITDA treated as CFADS / EBITDA/DSCR)
 - PPA consistency
 - Missing inputs not split into Blocking vs Non-blocking
 - Confidence not LOW when blocking inputs exist
+- Capital structure violation (asserting funding mix as fact in Strict mode)
+- Missing 'Financing Treatment of Overrun' section
 
 Output exactly:
 
@@ -257,14 +270,16 @@ Output exactly:
 MASTER_FIX_SYSTEM = """
 You are Nemexis Master. Correct Rev 1 to eliminate the listed violations.
 Rules:
-- In STRICT mode do not add numeric assumptions, do not compute debt capacity from EBITDA/DSCR, and do not label Computed without replicable path.
-- Ensure Missing Inputs is split into Blocking vs Non-blocking.
+- In STRICT mode do not add numeric assumptions.
+- Do not compute DSCR or debt capacity from EBITDA.
+- Do not assert funding mix as fact; present Case A/Case B.
+- Ensure Missing Inputs is split blocking/non-blocking.
 - If Blocking inputs exist, Confidence must be LOW.
 Return corrected Rev 1 only.
 """.strip()
 
 # ----------------------------
-# Model call helpers
+# Model calls
 # ----------------------------
 def call_openai(model_name: str, system: str, user_text: str) -> str:
     resp = openai_client.chat.completions.create(
@@ -333,6 +348,7 @@ if run:
             f"USER PROMPT:\n{user_text}\n\n"
             f"{INPUT_LOCK_RULES}\n\n{CLAIMS_AUDIT_RULES}\n\n{PPA_CONSISTENCY_RULE}\n\n"
             f"{CFADS_GUARDRAIL if STRICT_MODE else ''}\n\n"
+            f"{CAPITAL_STRUCTURE_GUARDRAIL if STRICT_MODE else ''}\n\n"
             f"{mode_rules}\n\n{NO_INVENTION_STRUCTURES}\n\n"
             f"OUTPUT FORMAT:\n{MASTER_FORMAT}"
         )
@@ -355,7 +371,7 @@ if run:
             f"ORBIT: {orbit_name}\n\n"
             f"MASTER DRAFT (REV 0):\n{rev0}\n\n"
             f"CRITIQUE FORMAT:\n{JUDGE_FORMAT}\n\n"
-            f"Explicitly check for guardrail violations, especially CFADS/DSCR misuse in STRICT."
+            f"Explicitly check for CFADS/DSCR misuse and capital-structure assertions in STRICT."
         )
 
         colA, colB = st.columns(2)
@@ -389,6 +405,7 @@ if run:
             f"USER PROMPT:\n{user_text}\n\n"
             f"{INPUT_LOCK_RULES}\n\n{CLAIMS_AUDIT_RULES}\n\n{PPA_CONSISTENCY_RULE}\n\n"
             f"{CFADS_GUARDRAIL if STRICT_MODE else ''}\n\n"
+            f"{CAPITAL_STRUCTURE_GUARDRAIL if STRICT_MODE else ''}\n\n"
             f"{mode_rules}\n\n{NO_INVENTION_STRUCTURES}\n\n"
             f"REV 0:\n{rev0}\n\nCRITIQUES:\n{critique_blob}\n\n"
             f"OUTPUT FORMAT:\n{MASTER_REV1_FORMAT}"
@@ -398,9 +415,7 @@ if run:
     st.markdown("### Rev 1 (Master)")
     st.write(rev1)
 
-    # ----------------------------
-    # Step 4 — Automatic Guardrail Check + Fix pass
-    # ----------------------------
+    # Step 4 — guardrail check + fix
     st.divider()
     st.markdown("## Step 4 — Guardrail Check (Auto-fix if needed)")
 
@@ -409,6 +424,7 @@ if run:
             f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
             f"STRICT RULES:\n{STRICT_RULES if STRICT_MODE else '(not strict)'}\n\n"
             f"CFADS GUARDRAIL:\n{CFADS_GUARDRAIL if STRICT_MODE else '(not strict)'}\n\n"
+            f"CAPITAL STRUCTURE GUARDRAIL:\n{CAPITAL_STRUCTURE_GUARDRAIL if STRICT_MODE else '(not strict)'}\n\n"
             f"REV 1:\n{rev1}"
         )
         guardrail_report = call_openai("gpt-4o-mini", GUARDRAIL_CHECK_SYSTEM, check_input)
@@ -417,23 +433,21 @@ if run:
     st.write(guardrail_report)
 
     rev1_fixed = rev1
-    if "## Should we regenerate Rev 1?\n- Yes" in guardrail_report or "Should we regenerate Rev 1?\n- Yes" in guardrail_report:
+    if "Should we regenerate Rev 1?\n- Yes" in guardrail_report:
         with st.spinner("Auto-fixing Rev 1 (producing Rev 1b)..."):
             fix_input = (
                 f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
                 f"VIOLATIONS REPORT:\n{guardrail_report}\n\n"
                 f"CURRENT REV 1:\n{rev1}\n\n"
                 f"USER PROMPT:\n{user_text}\n\n"
-                f"Remember: STRICT forbids CFADS/DSCR derived numbers from EBITDA, and Missing Inputs must be split blocking/non-blocking."
+                f"Return corrected Rev 1 only. Include Financing Treatment of Overrun with Case A/Case B."
             )
             rev1_fixed = call_openai(master_model, MASTER_FIX_SYSTEM, fix_input)
 
         st.markdown("### Rev 1b (Corrected by Auto-fix)")
         st.write(rev1_fixed)
 
-    # ----------------------------
-    # EXPORT
-    # ----------------------------
+    # Export
     export_text = f"""# Nemexis Export
 
 ## MODE
@@ -486,7 +500,7 @@ if run:
 
     st.divider()
     st.markdown("## Export")
-    copy_to_clipboard_button(export_text, "📋 Copy All (Rev0+Critiques+Rev1+Rev1b)")
+    copy_to_clipboard_button(export_text, "📋 Copy All")
     st.download_button(
         label="⬇️ Download as Markdown (.md)",
         data=export_text,

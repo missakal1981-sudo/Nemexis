@@ -1,28 +1,13 @@
 import os
+import time
 import streamlit as st
 from openai import OpenAI
 import anthropic
 import requests
 import streamlit.components.v1 as components
 
-# ============================
-# Nemexis — Iterative Moderated Flow with Guardrails + Export
-# Master: OpenAI
-# Judges: Claude + Grok
-# Orbits: Engineering, Finance, Contract/Legal, Risk/Governance
-# Iterations: Rev 0 -> Critiques -> Rev 1 (+ Changelog)
-# Guardrails (NEW):
-#   - Strict vs Bounding mode
-#   - Claims Audit enforcement (no "Computed" unless shown)
-#   - No numeric probabilities unless provided (Strict)
-#   - PPA fixed consistency rule
-# UX:
-#   - Copy all output button
-#   - Download markdown button
-# ============================
-
 st.set_page_config(page_title="Nemexis", layout="wide")
-st.title("Nemexis — Reliability Engine (Iterative Moderated Flow + Guardrails v2)")
+st.title("Nemexis — Reliability Engine (Iterative + Guardrails v3)")
 
 # ----------------------------
 # Password Gate
@@ -85,239 +70,195 @@ def copy_to_clipboard_button(text: str, button_label: str = "📋 Copy all outpu
     components.html(html, height=60)
 
 # ----------------------------
-# UI Controls
+# UI
 # ----------------------------
 st.markdown("### Inputs")
 prompt = st.text_area("User Prompt", height=160, placeholder="What are you trying to solve / decide?")
 context = st.text_area("Context (optional)", height=160, placeholder="Paste numbers, excerpts, constraints, assumptions...")
 
 st.markdown("### Settings")
-master_model = st.selectbox(
-    "Master model (OpenAI)",
-    ["gpt-4o-mini", "gpt-4o"],
-    index=0,
-    help="gpt-4o is stronger but costs more. Start with mini."
-)
+master_model = st.selectbox("Master model (OpenAI)", ["gpt-4o-mini", "gpt-4o"], index=0)
 
 claude_model = st.selectbox(
     "Claude judge model",
     ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"],
-    index=0
+    index=0,
 )
 
-grok_model = st.selectbox(
-    "Grok judge model",
-    ["grok-4-fast", "grok-4"],
-    index=0
-)
+grok_model = st.selectbox("Grok judge model", ["grok-4-fast", "grok-4"], index=0)
 
 mode = st.radio(
     "Assumptions mode",
-    ["Strict (no numeric assumptions)", "Bounding (allow ranges + scenario)"],
+    ["Strict (no numeric assumptions, no derived numbers)", "Bounding (allow ranges + scenarios)"],
     index=0,
-    help="Strict = no invented numeric assumptions (O&M %, tax rate, CF, probabilities). Bounding = allowed but must be ranges + clearly labeled scenarios."
 )
 
-run = st.button("Run Nemexis (Rev 0 → Critiques → Rev 1)")
-
-STRICT_MODE = (mode.startswith("Strict"))
+STRICT_MODE = mode.startswith("Strict")
+run = st.button("Run Nemexis (Rev 0 → Critiques → Rev 1 → Auto-fix)")
 
 # ----------------------------
 # Orbits
 # ----------------------------
 ORBITS = [
-    {
-        "name": "Technical Engineering",
-        "judge_mandate": (
-            "You are a senior offshore/industrial engineering reviewer. "
-            "Critique the Master draft for technical correctness and realism. "
-            "Focus on physics/constraints, failure modes, engineering assumptions, unit sanity checks, schedule realism, "
-            "and technical-financial coupling mistakes. "
-            "Do NOT rewrite the whole answer. Provide targeted critique and actionable fixes."
-        ),
+    {"name": "Technical Engineering", "judge_mandate":
+        "You are a senior offshore/industrial engineering reviewer. "
+        "Critique technical correctness/realism, failure modes, unit sanity checks, schedule realism, "
+        "and technical-financial coupling mistakes. Do NOT rewrite; provide targeted fixes."
     },
-    {
-        "name": "Economics / Project Finance",
-        "judge_mandate": (
-            "You are a project finance / infrastructure investment reviewer. "
-            "Critique the Master draft for economic and financial rigor. "
-            "Focus on cash-flow logic, timing, leverage/covenants, sensitivities, missing inputs, and math sanity checks. "
-            "Do NOT invent numbers. If inputs are missing, list them. "
-            "Do NOT rewrite the whole answer. Provide targeted critique and actionable fixes."
-        ),
+    {"name": "Economics / Project Finance", "judge_mandate":
+        "You are a project finance reviewer. Critique cash-flow logic, timing, covenants/DSCR, sensitivities, "
+        "and math sanity checks. Do NOT invent numbers. Do NOT rewrite; provide targeted fixes."
     },
-    {
-        "name": "Contract / Legal (Commercial)",
-        "judge_mandate": (
-            "You are a contracts/commercial & legal reviewer (project delivery + procurement). "
-            "Critique the Master draft for contractual/legal blind spots. "
-            "Focus on entitlement/pass-through, LDs/caps, change orders, termination triggers, compliance/approvals, "
-            "and what clauses/documents must be checked. "
-            "Not legal advice; this is issue-spotting and decision-support. "
-            "Do NOT rewrite the whole answer. Provide targeted critique and actionable fixes."
-        ),
+    {"name": "Contract / Legal (Commercial)", "judge_mandate":
+        "You are a contracts/commercial reviewer (delivery + procurement). Critique entitlement/pass-through, "
+        "LDs/caps, change orders, termination triggers, compliance/approvals, and what clauses must be checked. "
+        "Do NOT rewrite; provide targeted fixes."
     },
-    {
-        "name": "Risk / Governance",
-        "judge_mandate": (
-            "You are a risk officer focused on decision defensibility. "
-            "Critique the Master draft for ambiguity, overconfidence, missing assumptions, and validation gaps. "
-            "Produce a mini risk register (top risks), confidence assessment, and what would change the conclusion. "
-            "Do NOT rewrite the whole answer. Provide targeted critique and actionable fixes."
-        ),
+    {"name": "Risk / Governance", "judge_mandate":
+        "You are a risk officer. Critique ambiguity, overconfidence, missing assumptions, validation gaps. "
+        "Produce mini risk register + what changes the conclusion. Do NOT rewrite; provide targeted fixes."
     },
 ]
 
 # ----------------------------
-# Guardrail Specs
+# Guardrail Rules
 # ----------------------------
 INPUT_LOCK_RULES = """
-INPUT LOCK (MANDATORY):
-- You MUST create an 'Inputs Used (Verbatim)' section listing all user-provided inputs exactly as given.
-- You MUST also create an 'Assumptions Added by Master' section for anything not provided by the user.
-- You MAY NOT silently change any user-provided input.
-- If a number is missing, write 'Unknown' and list it under Missing Inputs—do NOT guess.
+INPUT LOCK:
+- Include 'Inputs Used (Verbatim)' listing user inputs exactly.
+- Include 'Assumptions Added by Master' for anything not provided.
+- Do NOT silently change user inputs.
 """.strip()
 
 CLAIMS_AUDIT_RULES = """
-CLAIMS AUDIT (MANDATORY):
-- You MUST include a 'Claims Audit' section.
-- Every numeric claim you make must be tagged as one of:
-  [Computed] [Estimated] [Assumed] [Unknown]
-- "Computed" is ONLY allowed if you show the calculation path (enough for an analyst to replicate).
-- If you cannot compute, you must say so and tag as [Unknown] or [Estimated] with basis.
-- Do NOT label base case IRR as [Computed] unless you actually reproduce it from the cashflow logic you present.
+CLAIMS AUDIT:
+- Include a 'Claims Audit' section.
+- Every numeric claim tagged: [Computed] [Estimated] [Assumed] [Unknown]
+- [Computed] only if you show enough calculation path to replicate.
+- Do NOT mark IRR as [Computed] unless you actually compute it from the cashflow logic you present.
 """.strip()
 
 PPA_CONSISTENCY_RULE = """
 PPA CONSISTENCY:
-- If the PPA is fixed price, do NOT list "PPA price volatility" as a risk unless you explicitly identify a repricing clause, merchant exposure, or volume/counterparty risk.
+- If PPA is fixed price, do NOT list 'PPA price volatility' as a risk unless you identify repricing/merchant exposure.
 """.strip()
 
-STRICT_MODE_RULE = """
-STRICT MODE:
-- You may NOT introduce any new numeric assumptions (tax rate, O&M %, capacity factor, probabilities, escalation rates, etc).
-- If required, list them as Unknown and request them under Missing Inputs.
-- You may provide directional conclusions, but must label them [Estimated] and explain the basis qualitatively.
+STRICT_RULES = """
+STRICT MODE (very important):
+- You may NOT introduce new numeric assumptions (tax rate, O&M %, capacity factor, probabilities, escalation, etc.).
+- You may NOT introduce derived numeric outputs (e.g., Debt Service = EBITDA/DSCR) unless the underlying quantity is explicitly provided (CFADS) and method defined.
+- Treat DSCR as a covenant/constraint, NOT as a calculator for debt service.
+- If required numbers are missing, write [Unknown] and list them under Missing Inputs.
+- If you cannot compute the key decision metric (IRR below/above 8%), Confidence must be LOW.
 """.strip()
 
-BOUNDING_MODE_RULE = """
+BOUNDING_RULES = """
 BOUNDING MODE:
-- You may introduce numeric assumptions ONLY as ranges, with a scenario table (Low/Base/High).
-- Every added numeric assumption must be tagged [Assumed] with a short basis.
-- You must clearly separate Scenario Outputs from Facts.
+- You may add numeric assumptions only as ranges + scenario table (Low/Base/High).
+- All added numeric assumptions tagged [Assumed] with brief basis.
+- Separate Scenario Outputs from Facts.
 """.strip()
 
-NO_INVENTION_RULE = """
+NO_INVENTION_STRUCTURES = """
 NO INVENTED STRUCTURES:
-- Do not invent interest-only debt, change debt tenor, or ignore the construction period.
-- If debt is "sculpted to DSCR", do not claim a specific debt service schedule unless provided; instead, state what must be modeled and what DSCR implies.
+- Do not invent interest-only debt, ignore construction period, or fabricate sculpted debt service schedule.
+- If a schedule is needed, say so and list required inputs.
 """.strip()
 
 # ----------------------------
-# Output Formats
+# Output formats
 # ----------------------------
-MASTER_REV0_SYSTEM = (
-    "You are Nemexis Master (OpenAI). Produce a first draft (Rev 0) that is decision-grade for IC/SteerCo. "
-    "Be conservative: do not overclaim. Strictly follow Input Lock and Claims Audit rules."
-)
-
-MASTER_OUTPUT_FORMAT = """
+MASTER_REV0_SYSTEM = "You are Nemexis Master (OpenAI). Produce Rev 0 that is decision-grade. Follow guardrails strictly."
+MASTER_FORMAT = """
 Return in this exact structure:
 
 ## Inputs Used (Verbatim)
-- List user-provided inputs exactly as provided
 
 ## Assumptions Added by Master
-- Only if needed
-- Tag each [Assumed] and justify briefly
-- In Strict mode: should usually be 'None' and instead list Unknowns
+(Strict mode: usually 'None' — instead list Unknowns)
 
 ## Executive Answer
-- 5 bullets max; decision-oriented
+(5 bullets max)
 
 ## Calculations / Logic
-- Show key steps
-- Do NOT invent missing numbers
 - Respect construction period
-- Respect DSCR sculpting (do not fabricate a schedule)
-- If missing inputs prevent computation, state explicitly and tag [Unknown]
+- Respect DSCR sculpting (do not fabricate schedule)
+- If key metric cannot be computed, say so
 
 ## Key Risks (ranked)
-- 5–10 bullets, ranked
 
 ## Contract / Legal Checks
-- Specific clauses/docs/questions
-
-## What to Validate Next
-- Concrete checks / documents / data
-
-## Claims Audit
-- List key numeric/quantitative claims and tag:
-  [Computed] [Estimated] [Assumed] [Unknown]
-  Include 1-line basis
-
-## Confidence
-- Low / Medium / High + why
-""".strip()
-
-JUDGE_CRITIQUE_FORMAT = """
-Return critique in this structure (do not rewrite the whole answer):
-
-## Summary Verdict
-- 1–3 bullets
-
-## Critical Issues (must-fix)
-- Bullet list
-
-## Corrections / Fixes
-- Specific edits/calculations to change
 
 ## Missing Inputs (required)
-- Bullet list
 
-## Questions for the Team
-- Bullet list
+## Claims Audit
+(tag each numeric claim)
 
-## Guardrail Violations Detected
-- Input Lock violations
-- Claims Audit violations
-- Invented numeric assumptions (especially in Strict mode)
-- PPA consistency issues
-
-## Confidence in Master Draft
-- Low / Medium / High + why
+## Confidence
 """.strip()
 
-MASTER_REV1_SYSTEM = (
-    "You are Nemexis Master (OpenAI) creating Rev 1. "
-    "You will receive Rev 0 plus critiques from multiple judges across four orbits. "
-    "Your job is to accept/reject critiques with reasons, correct errors, tighten assumptions, "
-    "and produce a stronger Rev 1. Strictly follow Input Lock and Claims Audit rules."
-)
+JUDGE_FORMAT = """
+Return critique:
 
-MASTER_REV1_OUTPUT_FORMAT = """
-Return in this exact structure:
+## Summary Verdict
+## Critical Issues (must-fix)
+## Corrections / Fixes
+## Missing Inputs (required)
+## Questions for the Team
+## Guardrail Violations Detected
+## Confidence in Master Draft
+""".strip()
+
+MASTER_REV1_SYSTEM = "You are Nemexis Master (OpenAI) creating Rev 1. Integrate critiques; accept/reject with reasons; follow guardrails."
+MASTER_REV1_FORMAT = """
+Return:
 
 # Changelog (Rev 0 → Rev 1)
-- Accepted critiques: bullet list
-- Rejected critiques (with reason): bullet list
-- Key edits applied: bullet list
+- Accepted critiques
+- Rejected critiques (with reason)
+- Key edits applied
 
 # Rev 1 (Updated Deliverable)
-(use the SAME structure as Rev 0)
+(use same structure as Rev 0)
+""".strip()
+
+GUARDRAIL_CHECK_SYSTEM = """
+You are Nemexis Guardrail Checker.
+Your job: read Rev 1 and detect violations of:
+- Strict mode rules (if strict)
+- Input Lock
+- Claims Audit (Computed without path)
+- DSCR misuse (e.g., using EBITDA/DSCR as debt service)
+- PPA consistency
+
+Output exactly:
+
+## Violations Found
+- bullet list (or 'None')
+
+## Required Corrections
+- bullet list (or 'None')
+
+## Should we regenerate Rev 1?
+- Yes/No
+""".strip()
+
+MASTER_FIX_SYSTEM = """
+You are Nemexis Master. You must correct Rev 1 to eliminate the listed violations.
+Rules:
+- Do not introduce new numeric assumptions in Strict mode.
+- Remove derived numbers not supported by inputs.
+- Downgrade confidence to Low if key metric cannot be computed.
+Return corrected Rev 1 only (no extra commentary).
 """.strip()
 
 # ----------------------------
-# Model Call Helpers
+# Model call helpers
 # ----------------------------
 def call_openai(model_name: str, system: str, user_text: str) -> str:
     resp = openai_client.chat.completions.create(
         model=model_name,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_text},
-        ],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user_text}],
         temperature=0.2,
     )
     return resp.choices[0].message.content
@@ -337,28 +278,29 @@ def call_claude(model_name: str, system: str, user_text: str) -> str:
     return out.strip()
 
 def call_grok(model_name: str, system: str, user_text: str) -> str:
-    r = requests.post(
-        "https://api.x.ai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {XAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_text},
-            ],
-            "temperature": 0.2,
-        },
-        timeout=75,
-    )
-    if r.status_code != 200:
-        return f"❌ Grok Error ({r.status_code}): {r.text}"
-    return r.json()["choices"][0]["message"]["content"]
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_text}],
+                    "temperature": 0.2,
+                },
+                timeout=120,  # increased
+            )
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+            last_err = f"❌ Grok Error ({r.status_code}): {r.text}"
+        except Exception as e:
+            last_err = f"❌ Grok Error: {str(e)}"
+        time.sleep(1.5 * (attempt + 1))
+    return last_err or "❌ Grok Error: unknown"
 
 # ----------------------------
-# Main Run
+# Run
 # ----------------------------
 if run:
     if not prompt.strip():
@@ -369,20 +311,18 @@ if run:
     if context.strip():
         user_text += "\n\n---\nContext:\n" + context.strip()
 
-    mode_rules = STRICT_MODE_RULE if STRICT_MODE else BOUNDING_MODE_RULE
+    mode_rules = STRICT_RULES if STRICT_MODE else BOUNDING_RULES
 
     st.divider()
     st.markdown("## Step 1 — Master Draft (Rev 0)")
 
-    with st.spinner("Master (OpenAI) generating Rev 0 with guardrails..."):
+    with st.spinner("Master generating Rev 0..."):
         rev0_input = (
+            f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
             f"USER PROMPT:\n{user_text}\n\n"
-            f"{INPUT_LOCK_RULES}\n\n"
-            f"{CLAIMS_AUDIT_RULES}\n\n"
-            f"{PPA_CONSISTENCY_RULE}\n\n"
-            f"{mode_rules}\n\n"
-            f"{NO_INVENTION_RULE}\n\n"
-            f"OUTPUT FORMAT:\n{MASTER_OUTPUT_FORMAT}"
+            f"{INPUT_LOCK_RULES}\n\n{CLAIMS_AUDIT_RULES}\n\n{PPA_CONSISTENCY_RULE}\n\n"
+            f"{mode_rules}\n\n{NO_INVENTION_STRUCTURES}\n\n"
+            f"OUTPUT FORMAT:\n{MASTER_FORMAT}"
         )
         rev0 = call_openai(master_model, MASTER_REV0_SYSTEM, rev0_input)
 
@@ -393,27 +333,23 @@ if run:
     st.markdown("## Step 2 — Orbit Critiques (Claude + Grok)")
 
     critiques = []
-
     for orbit in ORBITS:
         orbit_name = orbit["name"]
         mandate = orbit["judge_mandate"]
-
         st.markdown(f"### Orbit: {orbit_name}")
 
         judge_input = (
-            f"ORBIT:\n{orbit_name}\n\n"
-            f"YOUR MANDATE:\n{mandate}\n\n"
-            f"IMPORTANT: Critique the MASTER DRAFT. Do not rewrite it.\n\n"
             f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
+            f"ORBIT: {orbit_name}\n\n"
             f"MASTER DRAFT (REV 0):\n{rev0}\n\n"
-            f"CRITIQUE FORMAT:\n{JUDGE_CRITIQUE_FORMAT}"
+            f"CRITIQUE FORMAT:\n{JUDGE_FORMAT}\n\n"
+            f"Explicitly check for guardrail violations (Strict rules, DSCR misuse, Claims Audit issues)."
         )
 
         colA, colB = st.columns(2)
-
         with colA:
             st.markdown(f"#### Claude ({claude_model})")
-            with st.spinner(f"Claude critiquing: {orbit_name}..."):
+            with st.spinner("Claude critiquing..."):
                 try:
                     claude_out = call_claude(claude_model, mandate, judge_input)
                 except Exception as e:
@@ -422,49 +358,73 @@ if run:
 
         with colB:
             st.markdown(f"#### Grok ({grok_model})")
-            with st.spinner(f"Grok critiquing: {orbit_name}..."):
-                try:
-                    grok_out = call_grok(grok_model, mandate, judge_input)
-                except Exception as e:
-                    grok_out = f"❌ Grok Error: {str(e)}"
+            with st.spinner("Grok critiquing..."):
+                grok_out = call_grok(grok_model, mandate, judge_input)
             st.write(grok_out)
 
         critiques.append({"orbit": orbit_name, "claude": claude_out, "grok": grok_out})
 
     st.divider()
-    st.markdown("## Step 3 — Master Integration (Rev 1 + Changelog)")
+    st.markdown("## Step 3 — Master Integration (Rev 1)")
 
-    with st.spinner("Master (OpenAI) integrating critiques into Rev 1 with guardrails..."):
+    with st.spinner("Master integrating critiques into Rev 1..."):
         critique_blob = ""
         for c in critiques:
-            critique_blob += f"\n\n=== ORBIT: {c['orbit']} ===\n\n--- Claude Critique ---\n{c['claude']}\n\n--- Grok Critique ---\n{c['grok']}\n"
+            critique_blob += f"\n\n=== ORBIT: {c['orbit']} ===\n\n--- Claude ---\n{c['claude']}\n\n--- Grok ---\n{c['grok']}\n"
 
         rev1_input = (
-            f"USER PROMPT:\n{user_text}\n\n"
             f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
-            f"{INPUT_LOCK_RULES}\n\n"
-            f"{CLAIMS_AUDIT_RULES}\n\n"
-            f"{PPA_CONSISTENCY_RULE}\n\n"
-            f"{mode_rules}\n\n"
-            f"{NO_INVENTION_RULE}\n\n"
-            f"MASTER REV 0:\n{rev0}\n\n"
-            f"CRITIQUES:\n{critique_blob}\n\n"
-            f"OUTPUT FORMAT:\n{MASTER_REV1_OUTPUT_FORMAT}\n\n"
-            f"REMINDER: In Strict mode, do not add numeric assumptions—mark Unknown and request inputs."
+            f"USER PROMPT:\n{user_text}\n\n"
+            f"{INPUT_LOCK_RULES}\n\n{CLAIMS_AUDIT_RULES}\n\n{PPA_CONSISTENCY_RULE}\n\n"
+            f"{mode_rules}\n\n{NO_INVENTION_STRUCTURES}\n\n"
+            f"REV 0:\n{rev0}\n\nCRITIQUES:\n{critique_blob}\n\n"
+            f"OUTPUT FORMAT:\n{MASTER_REV1_FORMAT}"
         )
-
         rev1 = call_openai(master_model, MASTER_REV1_SYSTEM, rev1_input)
 
-    st.markdown("### Rev 1 (Master, with Changelog)")
+    st.markdown("### Rev 1 (Master)")
     st.write(rev1)
 
     # ----------------------------
-    # EXPORT BUNDLE
+    # Step 4 — Automatic Guardrail Check + Fix pass
+    # ----------------------------
+    st.divider()
+    st.markdown("## Step 4 — Guardrail Check (Auto-fix if needed)")
+
+    with st.spinner("Checking Rev 1 for guardrail violations..."):
+        check_input = (
+            f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
+            f"STRICT RULES:\n{STRICT_RULES if STRICT_MODE else '(not strict)'}\n\n"
+            f"REV 1:\n{rev1}"
+        )
+        guardrail_report = call_openai("gpt-4o-mini", GUARDRAIL_CHECK_SYSTEM, check_input)
+
+    st.markdown("### Guardrail Report")
+    st.write(guardrail_report)
+
+    rev1_fixed = rev1
+    if "## Should we regenerate Rev 1?\n- Yes" in guardrail_report or "Should we regenerate Rev 1?\n- Yes" in guardrail_report:
+        with st.spinner("Auto-fixing Rev 1 (producing Rev 1b)..."):
+            fix_input = (
+                f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
+                f"VIOLATIONS REPORT:\n{guardrail_report}\n\n"
+                f"CURRENT REV 1:\n{rev1}\n\n"
+                f"USER PROMPT:\n{user_text}\n\n"
+                f"Remember: in STRICT mode do not add numeric assumptions, do not misuse DSCR, "
+                f"and do not label Computed without a replicable path."
+            )
+            rev1_fixed = call_openai(master_model, MASTER_FIX_SYSTEM, fix_input)
+
+        st.markdown("### Rev 1b (Corrected by Auto-fix)")
+        st.write(rev1_fixed)
+
+    # ----------------------------
+    # EXPORT
     # ----------------------------
     export_text = f"""# Nemexis Export
 
 ## MODE
-{'STRICT (no numeric assumptions)' if STRICT_MODE else 'BOUNDING (ranges + scenario)'}
+{'STRICT' if STRICT_MODE else 'BOUNDING'}
 
 ## USER PROMPT
 {prompt.strip()}
@@ -492,18 +452,27 @@ if run:
 ### Grok
 {c['grok']}
 """
-
     export_text += f"""
 
 ---
 
 # REV 1 (Master)
 {rev1}
+
+---
+
+# GUARDRAIL REPORT
+{guardrail_report}
+
+---
+
+# REV 1b (Corrected)
+{rev1_fixed}
 """
 
     st.divider()
     st.markdown("## Export")
-    copy_to_clipboard_button(export_text, "📋 Copy Rev0 + Critiques + Rev1")
+    copy_to_clipboard_button(export_text, "📋 Copy All (Rev0+Critiques+Rev1+Rev1b)")
     st.download_button(
         label="⬇️ Download as Markdown (.md)",
         data=export_text,
@@ -511,12 +480,3 @@ if run:
         mime="text/markdown",
     )
     st.text_area("All output (easy Cmd/Ctrl+A then Copy)", value=export_text, height=320)
-
-    st.divider()
-    st.markdown("## What you have now")
-    st.markdown(
-        "- **Rev 0**: Master deliverable with strict guardrails\n"
-        "- **Orbit critiques**: Claude + Grok across Engineering/Finance/Legal/Risk\n"
-        "- **Rev 1**: Master integrated critiques + changelog\n"
-        "- **Export**: one-click copy + download\n"
-    )

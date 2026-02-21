@@ -1,4 +1,4 @@
 streamlit
 openai
 anthropic
-google-genai
+requests

@@ -1,20 +1,26 @@
 import os
-import json
 import streamlit as st
 from openai import OpenAI
 import anthropic
 import requests
+import streamlit.components.v1 as components
 
 # ============================
-# Nemexis — Iterative Moderated Flow
+# Nemexis — Iterative Moderated Flow with Guardrails
 # Master: OpenAI
 # Judges: Claude + Grok
 # Orbits: Engineering, Finance, Contract/Legal, Risk/Governance
 # Iterations: Rev 0 -> Critiques -> Rev 1 (+ Changelog)
+# Guardrails:
+#   1) Input Lock (verbatim "Inputs Used" section; no silent changes)
+#   2) Claims Audit (Computed / Estimated / Assumed / Unknown)
+# UX:
+#   - Copy all output button
+#   - Download markdown button
 # ============================
 
 st.set_page_config(page_title="Nemexis", layout="wide")
-st.title("Nemexis — Reliability Engine (Iterative Moderated Flow)")
+st.title("Nemexis — Reliability Engine (Iterative Moderated Flow + Guardrails)")
 
 # ----------------------------
 # Password Gate
@@ -46,6 +52,36 @@ if missing:
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ----------------------------
+# Copy-to-clipboard helper
+# ----------------------------
+def copy_to_clipboard_button(text: str, button_label: str = "📋 Copy all output"):
+    # Escape text for JS template literal
+    safe = text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+    html = f"""
+    <button id="copybtn" style="
+        padding:10px 14px; border-radius:10px; border:1px solid #ddd;
+        background:white; cursor:pointer; font-weight:600;">
+        {button_label}
+    </button>
+    <span id="copymsg" style="margin-left:10px; font-weight:600;"></span>
+    <script>
+    const btn = document.getElementById('copybtn');
+    const msg = document.getElementById('copymsg');
+    btn.onclick = async () => {{
+        try {{
+            await navigator.clipboard.writeText(`{safe}`);
+            msg.textContent = "Copied ✅";
+            setTimeout(() => msg.textContent = "", 2000);
+        }} catch (e) {{
+            msg.textContent = "Copy failed (browser blocked) ❌";
+            setTimeout(() => msg.textContent = "", 3000);
+        }}
+    }};
+    </script>
+    """
+    components.html(html, height=60)
 
 # ----------------------------
 # UI Controls
@@ -84,9 +120,9 @@ ORBITS = [
         "name": "Technical Engineering",
         "judge_mandate": (
             "You are a senior offshore/industrial engineering reviewer. "
-            "Your job is to critique the Master draft for technical correctness and realism. "
+            "Critique the Master draft for technical correctness and realism. "
             "Focus on physics/constraints, failure modes, engineering assumptions, unit sanity checks, schedule realism, "
-            "and any technical-financial coupling mistakes. "
+            "and technical-financial coupling mistakes. "
             "Do NOT rewrite the whole answer. Provide targeted critique and actionable fixes."
         ),
     },
@@ -96,7 +132,7 @@ ORBITS = [
             "You are a project finance / infrastructure investment reviewer. "
             "Critique the Master draft for economic and financial rigor. "
             "Focus on cash-flow logic, timing, leverage/covenants, sensitivities, missing inputs, and math sanity checks. "
-            "Do NOT invent numbers. If required inputs are missing, explicitly list them. "
+            "Do NOT invent numbers. If inputs are missing, list them. "
             "Do NOT rewrite the whole answer. Provide targeted critique and actionable fixes."
         ),
     },
@@ -106,7 +142,7 @@ ORBITS = [
             "You are a contracts/commercial & legal reviewer (project delivery + procurement). "
             "Critique the Master draft for contractual/legal blind spots. "
             "Focus on entitlement/pass-through, LDs/caps, change orders, termination triggers, compliance/approvals, "
-            "tariff/classification nuances (if relevant), and what clauses/documents must be checked. "
+            "and what clauses/documents must be checked. "
             "Not legal advice; this is issue-spotting and decision-support. "
             "Do NOT rewrite the whole answer. Provide targeted critique and actionable fixes."
         ),
@@ -123,37 +159,72 @@ ORBITS = [
 ]
 
 # ----------------------------
-# Core Prompt Templates
+# Guardrail Specs
 # ----------------------------
+INPUT_LOCK_RULES = """
+INPUT LOCK (MANDATORY):
+- You MUST create an 'Inputs Used (Verbatim)' section listing all user-provided inputs exactly as given.
+- You MUST also create an 'Assumptions Added by Master' section for anything not provided by the user.
+- You MAY NOT silently change any user-provided input.
+- If a number is missing, write 'Unknown' and list it under Missing Inputs—do NOT guess.
+""".strip()
 
+CLAIMS_AUDIT_RULES = """
+CLAIMS AUDIT (MANDATORY):
+- You MUST include a 'Claims Audit' section.
+- Every numeric claim you make must be tagged as one of:
+  [Computed] [Estimated] [Assumed] [Unknown]
+- If you state an IRR range or DSCR result, you must tag it [Computed] AND show the calculation path.
+- If you cannot compute, you must say so and tag as [Unknown] or [Estimated] with basis.
+""".strip()
+
+NO_INVENTION_RULE = """
+NO INVENTED INPUTS:
+- Do not invent interest-only structures, tenors, DSCRs, CAPEX phasing, or EBITDA build-ups unless explicitly provided.
+- If you introduce a simplifying assumption, label it [Assumed] and explain why it is reasonable.
+""".strip()
+
+# ----------------------------
+# Output Formats
+# ----------------------------
 MASTER_REV0_SYSTEM = (
-    "You are Nemexis Master (OpenAI). Your job is to produce the best possible first draft (Rev 0) "
-    "that a professional could take into an IC/SteerCo/board discussion. "
-    "Be precise, structured, and conservative with claims. "
-    "If a critical input is missing, list it rather than guessing."
+    "You are Nemexis Master (OpenAI). Produce a first draft (Rev 0) that is decision-grade for IC/SteerCo. "
+    "Be conservative: do not overclaim. Strictly follow Input Lock and Claims Audit rules."
 )
 
-MASTER_OUTPUT_FORMAT = """
+MASTER_REV0_OUTPUT_FORMAT = """
 Return Rev 0 in this exact structure:
 
-## Executive Answer
-- 5 bullets maximum, decision-oriented
+## Inputs Used (Verbatim)
+- List user-provided inputs exactly as provided (numbers, terms, constraints)
 
-## Key Assumptions
-- Bullet list
+## Assumptions Added by Master
+- Only if needed; tag each [Assumed] and justify briefly
+
+## Executive Answer
+- 5 bullets max; decision-oriented
 
 ## Calculations / Logic
-- Show key steps, do not invent missing numbers
-- If you need inputs, list them as placeholders
+- Show key steps
+- Do NOT invent missing numbers
+- If missing inputs prevent computation, state that explicitly and tag [Unknown]
 
 ## Key Risks (ranked)
 - 5–10 bullets, ranked
 
+## Contract / Legal Checks
+- Specific clauses/docs/questions (no generic fluff)
+
 ## What to Validate Next
-- concrete checks / documents / data needed
+- Concrete checks / documents / data
+
+## Claims Audit
+- List the key numeric/quantitative claims you made, each tagged:
+  [Computed] [Estimated] [Assumed] [Unknown]
+  Include 1-line basis for each.
 
 ## Confidence
-- Low / Medium / High + 1–2 lines why
+- Low / Medium / High + why
 """.strip()
 
 JUDGE_CRITIQUE_FORMAT = """
@@ -163,16 +234,16 @@ Return critique in this structure (do not rewrite the whole answer):
 - 1–3 bullets on overall quality
 
 ## Critical Issues (must-fix)
-- Bullet list (with short rationale)
+- Bullet list (short rationale)
 
 ## Corrections / Fixes
-- Bullet list of specific edits or calculations to change
+- Specific edits/calculations to change
 
 ## Missing Inputs (required)
 - Bullet list
 
 ## Questions for the Team
-- Bullet list of questions to resolve uncertainty
+- Bullet list
 
 ## Confidence in Master Draft
 - Low / Medium / High + why
@@ -181,9 +252,8 @@ Return critique in this structure (do not rewrite the whole answer):
 MASTER_REV1_SYSTEM = (
     "You are Nemexis Master (OpenAI) creating Rev 1. "
     "You will receive Rev 0 plus critiques from multiple judges across four orbits. "
-    "Your job is to: (1) accept/reject critique items with reasoning, "
-    "(2) correct errors, (3) tighten assumptions, (4) produce a stronger Rev 1. "
-    "Do NOT blindly merge everything. Keep it coherent and decision-grade."
+    "Your job is to accept/reject critiques with reasons, correct errors, tighten assumptions, "
+    "and produce a stronger Rev 1. Strictly follow Input Lock and Claims Audit rules."
 )
 
 MASTER_REV1_OUTPUT_FORMAT = """
@@ -195,13 +265,12 @@ Return in this exact structure:
 - Key edits applied: bullet list
 
 # Rev 1 (Updated Deliverable)
-(use the same structure as Rev 0)
+(use the SAME structure as Rev 0, including Inputs Used (Verbatim), Assumptions Added by Master, and Claims Audit)
 """.strip()
 
 # ----------------------------
 # Model Call Helpers
 # ----------------------------
-
 def call_openai(model_name: str, system: str, user_text: str) -> str:
     resp = openai_client.chat.completions.create(
         model=model_name,
@@ -213,11 +282,10 @@ def call_openai(model_name: str, system: str, user_text: str) -> str:
     )
     return resp.choices[0].message.content
 
-
 def call_claude(model_name: str, system: str, user_text: str) -> str:
     msg = anthropic_client.messages.create(
         model=model_name,
-        max_tokens=1600,
+        max_tokens=1800,
         temperature=0.2,
         system=system,
         messages=[{"role": "user", "content": user_text}],
@@ -227,7 +295,6 @@ def call_claude(model_name: str, system: str, user_text: str) -> str:
         if hasattr(block, "text"):
             out += block.text
     return out.strip()
-
 
 def call_grok(model_name: str, system: str, user_text: str) -> str:
     r = requests.post(
@@ -244,12 +311,11 @@ def call_grok(model_name: str, system: str, user_text: str) -> str:
             ],
             "temperature": 0.2,
         },
-        timeout=60,
+        timeout=75,
     )
     if r.status_code != 200:
         return f"❌ Grok Error ({r.status_code}): {r.text}"
     return r.json()["choices"][0]["message"]["content"]
-
 
 # ----------------------------
 # Main Run
@@ -266,8 +332,14 @@ if run:
     st.divider()
     st.markdown("## Step 1 — Master Draft (Rev 0)")
 
-    with st.spinner("Master (OpenAI) generating Rev 0..."):
-        rev0_input = f"USER PROMPT:\n{user_text}\n\nOUTPUT FORMAT:\n{MASTER_OUTPUT_FORMAT}"
+    with st.spinner("Master (OpenAI) generating Rev 0 with guardrails..."):
+        rev0_input = (
+            f"USER PROMPT:\n{user_text}\n\n"
+            f"{INPUT_LOCK_RULES}\n\n"
+            f"{CLAIMS_AUDIT_RULES}\n\n"
+            f"{NO_INVENTION_RULE}\n\n"
+            f"OUTPUT FORMAT:\n{MASTER_REV0_OUTPUT_FORMAT}"
+        )
         rev0 = call_openai(master_model, MASTER_REV0_SYSTEM, rev0_input)
 
     st.markdown("### Rev 0 (Master)")
@@ -276,7 +348,7 @@ if run:
     st.divider()
     st.markdown("## Step 2 — Orbit Critiques (Claude + Grok)")
 
-    critiques = []  # store structured critiques for Rev1 integration
+    critiques = []
 
     for orbit in ORBITS:
         orbit_name = orbit["name"]
@@ -287,8 +359,13 @@ if run:
         judge_input = (
             f"ORBIT:\n{orbit_name}\n\n"
             f"YOUR MANDATE:\n{mandate}\n\n"
+            f"IMPORTANT: You are critiquing the MASTER DRAFT. Do not rewrite it.\n\n"
             f"MASTER DRAFT (REV 0):\n{rev0}\n\n"
-            f"CRITIQUE FORMAT:\n{JUDGE_CRITIQUE_FORMAT}"
+            f"CRITIQUE FORMAT:\n{JUDGE_CRITIQUE_FORMAT}\n\n"
+            f"Also explicitly check for:\n"
+            f"- Violations of Input Lock (silent changed inputs)\n"
+            f"- Violations of Claims Audit (numbers stated without basis)\n"
+            f"- Invented assumptions presented as facts\n"
         )
 
         colA, colB = st.columns(2)
@@ -311,28 +388,25 @@ if run:
                     grok_out = f"❌ Grok Error: {str(e)}"
             st.write(grok_out)
 
-        critiques.append(
-            {
-                "orbit": orbit_name,
-                "claude": claude_out,
-                "grok": grok_out,
-            }
-        )
+        critiques.append({"orbit": orbit_name, "claude": claude_out, "grok": grok_out})
 
     st.divider()
     st.markdown("## Step 3 — Master Integration (Rev 1 + Changelog)")
 
-    with st.spinner("Master (OpenAI) integrating critiques into Rev 1..."):
+    with st.spinner("Master (OpenAI) integrating critiques into Rev 1 with guardrails..."):
         critique_blob = ""
         for c in critiques:
             critique_blob += f"\n\n=== ORBIT: {c['orbit']} ===\n\n--- Claude Critique ---\n{c['claude']}\n\n--- Grok Critique ---\n{c['grok']}\n"
 
         rev1_input = (
             f"USER PROMPT:\n{user_text}\n\n"
+            f"{INPUT_LOCK_RULES}\n\n"
+            f"{CLAIMS_AUDIT_RULES}\n\n"
+            f"{NO_INVENTION_RULE}\n\n"
             f"MASTER REV 0:\n{rev0}\n\n"
             f"CRITIQUES:\n{critique_blob}\n\n"
             f"OUTPUT FORMAT:\n{MASTER_REV1_OUTPUT_FORMAT}\n\n"
-            f"Remember: accept/reject with reasons, correct errors, tighten assumptions, no blind merging."
+            f"REMINDER: If you cannot compute a numeric claim, tag it [Unknown] and list missing inputs."
         )
 
         rev1 = call_openai(master_model, MASTER_REV1_SYSTEM, rev1_input)
@@ -340,11 +414,63 @@ if run:
     st.markdown("### Rev 1 (Master, with Changelog)")
     st.write(rev1)
 
+    # ----------------------------
+    # EXPORT BUNDLE (Copy + Download)
+    # ----------------------------
+    export_text = f"""# Nemexis Export
+
+## USER PROMPT
+{prompt.strip()}
+
+## CONTEXT
+{context.strip() if context.strip() else "(none)"}
+
+---
+
+# REV 0 (Master)
+{rev0}
+
+---
+
+# ORBIT CRITIQUES (Claude + Grok)
+"""
+    for c in critiques:
+        export_text += f"""
+
+## ORBIT: {c['orbit']}
+
+### Claude
+{c['claude']}
+
+### Grok
+{c['grok']}
+"""
+
+    export_text += f"""
+
+---
+
+# REV 1 (Master)
+{rev1}
+"""
+
+    st.divider()
+    st.markdown("## Export")
+    copy_to_clipboard_button(export_text, "📋 Copy Rev0 + Critiques + Rev1")
+    st.download_button(
+        label="⬇️ Download as Markdown (.md)",
+        data=export_text,
+        file_name="nemexis_output.md",
+        mime="text/markdown",
+    )
+    st.text_area("All output (easy Cmd/Ctrl+A then Copy)", value=export_text, height=320)
+
     st.divider()
     st.markdown("## What you have now")
     st.markdown(
-        "- **Rev 0**: Master initial deliverable\n"
+        "- **Rev 0**: Master initial deliverable with Input Lock + Claims Audit\n"
         "- **Orbit critiques**: Claude + Grok challenged Rev 0 across Engineering/Finance/Legal/Risk\n"
-        "- **Rev 1**: Master integrated critiques with an explicit changelog\n\n"
-        "Next upgrade (optional): run the orbit critics again on Rev 1 to produce Rev 2."
+        "- **Rev 1**: Master integrated critiques with explicit changelog + guardrails\n"
+        "- **Export**: One-click copy + download\n\n"
+        "Next upgrade (optional): run critics again on Rev 1 to produce Rev 2."
     )

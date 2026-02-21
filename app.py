@@ -1,510 +1,228 @@
 import os
-import time
 import streamlit as st
 from openai import OpenAI
 import anthropic
 import requests
-import streamlit.components.v1 as components
+import datetime
 
-st.set_page_config(page_title="Nemexis", layout="wide")
-st.title("Nemexis — Reliability Engine (Iterative + Guardrails v5)")
+# =====================================================
+# Nemexis v3 — Universal Reliability Engine
+# Master: OpenAI
+# Critics: Claude + Grok
+# Layers:
+#   1. STRICT (Audit / Epistemic Safe)
+#   2. DIRECTIONAL OVERLAY (Executive-Grade, Bounded)
+# =====================================================
 
-# ----------------------------
-# Password Gate
-# ----------------------------
+st.set_page_config(page_title="Nemexis v3", layout="wide")
+st.title("Nemexis v3 — Universal Reliability Engine")
+
+# ===============================
+# Password Gate (optional)
+# ===============================
 APP_PASSWORD = os.getenv("NEMEXIS_PASSWORD", "").strip()
 if APP_PASSWORD:
     entered = st.text_input("Password", type="password")
     if entered != APP_PASSWORD:
         st.stop()
 
-# ----------------------------
-# Load Keys
-# ----------------------------
+# ===============================
+# Load API Keys
+# ===============================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
 
-missing = []
 if not OPENAI_API_KEY:
-    missing.append("OPENAI_API_KEY")
-if not ANTHROPIC_API_KEY:
-    missing.append("ANTHROPIC_API_KEY")
-if not XAI_API_KEY:
-    missing.append("XAI_API_KEY")
-
-if missing:
-    st.error(f"Missing secrets: {', '.join(missing)} (Manage app → Settings → Secrets)")
+    st.error("Missing OPENAI_API_KEY")
     st.stop()
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ----------------------------
-# Copy helper
-# ----------------------------
-def copy_to_clipboard_button(text: str, button_label: str = "📋 Copy all output"):
-    safe = text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
-    html = f"""
-    <button id="copybtn" style="
-        padding:10px 14px; border-radius:10px; border:1px solid #ddd;
-        background:white; cursor:pointer; font-weight:600;">
-        {button_label}
-    </button>
-    <span id="copymsg" style="margin-left:10px; font-weight:600;"></span>
-    <script>
-    const btn = document.getElementById('copybtn');
-    const msg = document.getElementById('copymsg');
-    btn.onclick = async () => {{
-        try {{
-            await navigator.clipboard.writeText(`{safe}`);
-            msg.textContent = "Copied ✅";
-            setTimeout(() => msg.textContent = "", 2000);
-        }} catch (e) {{
-            msg.textContent = "Copy failed (browser blocked) ❌";
-            setTimeout(() => msg.textContent = "", 3000);
-        }}
-    }};
-    </script>
-    """
-    components.html(html, height=60)
+anthropic_client = None
+if ANTHROPIC_API_KEY:
+    anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ----------------------------
-# UI
-# ----------------------------
-st.markdown("### Inputs")
-prompt = st.text_area("User Prompt", height=160)
-context = st.text_area("Context (optional)", height=160)
-
-st.markdown("### Settings")
-master_model = st.selectbox("Master model (OpenAI)", ["gpt-4o-mini", "gpt-4o"], index=0)
-claude_model = st.selectbox(
-    "Claude judge model",
-    ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"],
-    index=0,
+# ===============================
+# UI Controls
+# ===============================
+mode = st.selectbox(
+    "Mode",
+    ["STRICT (Audit Only)", "STRICT + Directional Overlay (Recommended)"],
+    index=1
 )
-grok_model = st.selectbox("Grok judge model", ["grok-4-fast", "grok-4"], index=0)
 
-mode = st.radio(
-    "Assumptions mode",
-    ["Strict (no numeric assumptions, no derived numbers)", "Bounding (allow ranges + scenarios)"],
-    index=0,
-)
-STRICT_MODE = mode.startswith("Strict")
-run = st.button("Run Nemexis (Rev 0 → Critiques → Rev 1 → Auto-fix)")
+prompt = st.text_area("User Prompt", height=200)
+context = st.text_area("Additional Context (optional)", height=150)
 
-# ----------------------------
-# Orbits
-# ----------------------------
-ORBITS = [
-    {"name": "Technical Engineering", "judge_mandate":
-        "You are a senior offshore/industrial engineering reviewer. Critique technical correctness/realism, "
-        "failure modes, unit sanity checks, schedule realism, and technical-financial coupling mistakes. "
-        "Do NOT rewrite; provide targeted fixes."
-    },
-    {"name": "Economics / Project Finance", "judge_mandate":
-        "You are a project finance reviewer. Critique cash-flow logic, timing, covenants/DSCR, sensitivities, "
-        "and math sanity checks. Do NOT invent numbers. Do NOT rewrite; provide targeted fixes."
-    },
-    {"name": "Contract / Legal (Commercial)", "judge_mandate":
-        "You are a contracts/commercial reviewer. Critique entitlement/pass-through, LDs/caps, change orders, "
-        "termination triggers, compliance/approvals, and what clauses must be checked. "
-        "Do NOT rewrite; provide targeted fixes."
-    },
-    {"name": "Risk / Governance", "judge_mandate":
-        "You are a risk officer. Critique ambiguity, overconfidence, missing assumptions, validation gaps. "
-        "Produce mini risk register + what changes the conclusion. Do NOT rewrite; provide targeted fixes."
-    },
-]
+run = st.button("Run Nemexis")
 
-# ----------------------------
-# Guardrails
-# ----------------------------
-INPUT_LOCK_RULES = """
-INPUT LOCK:
-- Include 'Inputs Used (Verbatim)' listing user inputs exactly.
-- Include 'Assumptions Added by Master' for anything not provided.
-- Do NOT silently change user inputs.
-""".strip()
+# ===============================
+# System Prompts
+# ===============================
 
-CLAIMS_AUDIT_RULES = """
-CLAIMS AUDIT:
-- Include 'Claims Audit'.
-- Every numeric claim tagged: [Computed] [Estimated] [Assumed] [Unknown]
-- [Computed] only if you show enough calculation path to replicate.
-- Do NOT mark IRR as [Computed] unless you actually compute it from the cashflow logic you present.
-""".strip()
+STRICT_SYSTEM = """
+You are Nemexis STRICT Layer.
 
-PPA_CONSISTENCY_RULE = """
-PPA CONSISTENCY:
-- If PPA is fixed price, do NOT list 'PPA price volatility' as a risk unless you identify repricing/merchant exposure.
-""".strip()
+Rules:
+- Do NOT invent missing numbers.
+- If calculation requires missing inputs, explicitly state "Cannot compute".
+- Label every numeric item as:
+  [Known] [Computed] [Assumed] [Unknown]
+- Separate Blocking vs Non-Blocking missing inputs.
+- No directional speculation beyond input logic.
+"""
 
-CFADS_GUARDRAIL = """
-CFADS / DSCR GUARDRAIL (STRICT):
-- DSCR is based on CFADS, not EBITDA.
-- If only EBITDA is provided, DSCR headroom and debt capacity are [Unknown] unless a CFADS bridge is provided.
-- You may NOT compute debt service or max debt capacity from EBITDA/DSCR in Strict mode.
-""".strip()
-
-CAPITAL_STRUCTURE_GUARDRAIL = """
-CAPITAL STRUCTURE GUARDRAIL (STRICT):
-- In Strict mode, you may NOT assert post-overrun debt/equity funding as fact.
-- You MUST present 'Financing Treatment of Overrun' with two explicit cases:
-  Case A: Debt capped at base commitment; overrun equity-funded.
-  Case B: Debt upsized requires lender consent + CFADS/DSCR headroom (Unknown without model).
-- You may compute arithmetic (e.g., total CAPEX after overrun), but you must label funding mix as [Unknown] unless provided.
-""".strip()
-
-STRICT_RULES = """
-STRICT MODE:
-- No new numeric assumptions (tax rate, O&M %, capacity factor, probabilities, escalation, etc.).
-- No derived numeric outputs unless underlying inputs are explicitly provided.
-- If key decision metric cannot be computed, Confidence must be LOW.
-""".strip()
-
-BOUNDING_RULES = """
-BOUNDING MODE:
-- You may add numeric assumptions only as ranges + scenario table (Low/Base/High).
-- All added numeric assumptions tagged [Assumed] with brief basis.
-- Separate Scenario Outputs from Facts.
-""".strip()
-
-NO_INVENTION_STRUCTURES = """
-NO INVENTED STRUCTURES:
-- Do not invent interest-only debt, ignore construction period, or fabricate sculpted debt service schedule.
-- If a schedule is needed, say so and list required inputs.
-""".strip()
-
-# ----------------------------
-# Output format
-# ----------------------------
-MASTER_REV0_SYSTEM = "You are Nemexis Master (OpenAI). Produce Rev 0 that is decision-grade. Follow guardrails strictly."
-
-MASTER_FORMAT = """
-Return in this exact structure:
+STRICT_FORMAT = """
+Return in this structure:
 
 ## Inputs Used (Verbatim)
 
-## Assumptions Added by Master
-(Strict: usually None; instead list Unknowns)
+## Assumptions Added (Explicit)
 
-## Financing Treatment of Overrun (MANDATORY)
-- Case A (Debt capped): what becomes Unknown, what must be checked
-- Case B (Debt upsized): what becomes Unknown, what must be checked
-
-## Executive Answer
-(5 bullets max)
+## Executive Answer (Strict)
 
 ## Calculations / Logic
-- Respect construction period
-- Respect DSCR sculpting (do not fabricate schedule)
-- If key metric cannot be computed, say so
 
-## Key Risks (ranked)
+## Key Risks (Ranked)
 
-## Contract / Legal Checks
-
-## Missing Inputs (required)
-Split into:
-### Blocking (prevents answering Q1)
-### Non-blocking (nice-to-have)
+## Missing Inputs
+### Blocking
+### Non-Blocking
 
 ## Claims Audit
-(tag each numeric claim)
+(Label every numeric item)
 
 ## Confidence
-""".strip()
+"""
 
-JUDGE_FORMAT = """
-Return critique:
+OVERLAY_SYSTEM = """
+You are Nemexis Directional Overlay Layer.
 
-## Summary Verdict
-## Critical Issues (must-fix)
-## Corrections / Fixes
-## Missing Inputs (required)
-## Questions for the Team
-## Guardrail Violations Detected
-## Confidence in Master Draft
-""".strip()
+You are NOT allowed to:
+- Introduce new hard numeric assumptions
+- Contradict the STRICT layer
 
-MASTER_REV1_SYSTEM = "You are Nemexis Master (OpenAI) creating Rev 1. Integrate critiques; accept/reject with reasons; follow guardrails."
+You ARE allowed to:
+- Provide bounded directional reasoning
+- Provide sensitivity framing
+- Provide IF-THEN scenarios
+- Provide executive IC framing
+- Provide risk-adjusted decision narrative
 
-MASTER_REV1_FORMAT = """
-Return:
+All reasoning must:
+- Be consistent with STRICT output
+- Clearly label assumptions
+- Use ranges if needed
+- Never fabricate CFADS/DSCR values
 
-# Changelog (Rev 0 → Rev 1)
-- Accepted critiques
-- Rejected critiques (with reason)
-- Key edits applied
+Your goal:
+Produce an IC-ready executive brief superior to a single-model memo.
+"""
 
-# Rev 1 (Updated Deliverable)
-(use same structure as Rev 0, including Financing Treatment of Overrun)
-""".strip()
+OVERLAY_FORMAT = """
+# Directional Executive Overlay (Non-Binding)
 
-GUARDRAIL_CHECK_SYSTEM = """
-You are Nemexis Guardrail Checker.
-Detect violations of:
-- Strict mode rules (if strict)
-- Input Lock
-- Claims Audit (Computed without path)
-- DSCR misuse (EBITDA treated as CFADS / EBITDA/DSCR)
-- PPA consistency
-- Missing inputs not split into Blocking vs Non-blocking
-- Confidence not LOW when blocking inputs exist
-- Capital structure violation (asserting funding mix as fact in Strict mode)
-- Missing 'Financing Treatment of Overrun' section
+## Decision Framing
 
-Output exactly:
+## Downside Case (Bounded)
 
-## Violations Found
-- bullet list (or 'None')
+## Base Case Interpretation
 
-## Required Corrections
-- bullet list (or 'None')
+## What Could Flip the Conclusion
 
-## Should we regenerate Rev 1?
-- Yes/No
-""".strip()
+## IC-Ready Summary (10 bullets max)
+"""
 
-MASTER_FIX_SYSTEM = """
-You are Nemexis Master. Correct Rev 1 to eliminate the listed violations.
-Rules:
-- In STRICT mode do not add numeric assumptions.
-- Do not compute DSCR or debt capacity from EBITDA.
-- Do not assert funding mix as fact; present Case A/Case B.
-- Ensure Missing Inputs is split blocking/non-blocking.
-- If Blocking inputs exist, Confidence must be LOW.
-Return corrected Rev 1 only.
-""".strip()
+# ===============================
+# Model Call Helpers
+# ===============================
 
-# ----------------------------
-# Model calls
-# ----------------------------
-def call_openai(model_name: str, system: str, user_text: str) -> str:
+def call_openai(system, user_text, temperature=0.2):
     resp = openai_client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user_text}],
-        temperature=0.2,
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ],
+        temperature=temperature,
     )
     return resp.choices[0].message.content
 
-def call_claude(model_name: str, system: str, user_text: str) -> str:
-    msg = anthropic_client.messages.create(
-        model=model_name,
-        max_tokens=1800,
-        temperature=0.2,
-        system=system,
-        messages=[{"role": "user", "content": user_text}],
-    )
-    out = ""
-    for block in msg.content:
-        if hasattr(block, "text"):
-            out += block.text
-    return out.strip()
 
-def call_grok(model_name: str, system: str, user_text: str) -> str:
-    last_err = None
-    for attempt in range(3):
-        try:
-            r = requests.post(
-                "https://api.x.ai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": model_name,
-                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_text}],
-                    "temperature": 0.2,
-                },
-                timeout=140,
-            )
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"]
-            last_err = f"❌ Grok Error ({r.status_code}): {r.text}"
-        except Exception as e:
-            last_err = f"❌ Grok Error: {str(e)}"
-        time.sleep(1.5 * (attempt + 1))
-    return last_err or "❌ Grok Error: unknown"
-
-# ----------------------------
-# Run
-# ----------------------------
+# ===============================
+# Run Engine
+# ===============================
 if run:
+
     if not prompt.strip():
-        st.error("Please enter a User Prompt.")
+        st.error("Please enter a prompt.")
         st.stop()
 
-    user_text = prompt.strip()
+    full_input = prompt
     if context.strip():
-        user_text += "\n\n---\nContext:\n" + context.strip()
-
-    mode_rules = STRICT_RULES if STRICT_MODE else BOUNDING_RULES
+        full_input += "\n\n---\nContext:\n" + context.strip()
 
     st.divider()
-    st.markdown("## Step 1 — Master Draft (Rev 0)")
+    st.markdown("## STRICT Layer (Audit-Grade)")
 
-    with st.spinner("Master generating Rev 0..."):
-        rev0_input = (
-            f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
-            f"USER PROMPT:\n{user_text}\n\n"
-            f"{INPUT_LOCK_RULES}\n\n{CLAIMS_AUDIT_RULES}\n\n{PPA_CONSISTENCY_RULE}\n\n"
-            f"{CFADS_GUARDRAIL if STRICT_MODE else ''}\n\n"
-            f"{CAPITAL_STRUCTURE_GUARDRAIL if STRICT_MODE else ''}\n\n"
-            f"{mode_rules}\n\n{NO_INVENTION_STRUCTURES}\n\n"
-            f"OUTPUT FORMAT:\n{MASTER_FORMAT}"
-        )
-        rev0 = call_openai(master_model, MASTER_REV0_SYSTEM, rev0_input)
+    strict_output = call_openai(
+        STRICT_SYSTEM,
+        full_input + "\n\nFORMAT:\n" + STRICT_FORMAT,
+        temperature=0.1
+    )
 
-    st.markdown("### Rev 0 (Master)")
-    st.write(rev0)
+    st.write(strict_output)
 
-    st.divider()
-    st.markdown("## Step 2 — Orbit Critiques (Claude + Grok)")
+    final_output = strict_output
 
-    critiques = []
-    for orbit in ORBITS:
-        orbit_name = orbit["name"]
-        mandate = orbit["judge_mandate"]
-        st.markdown(f"### Orbit: {orbit_name}")
+    # ===============================
+    # Directional Overlay
+    # ===============================
+    if mode == "STRICT + Directional Overlay (Recommended)":
 
-        judge_input = (
-            f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
-            f"ORBIT: {orbit_name}\n\n"
-            f"MASTER DRAFT (REV 0):\n{rev0}\n\n"
-            f"CRITIQUE FORMAT:\n{JUDGE_FORMAT}\n\n"
-            f"Explicitly check for CFADS/DSCR misuse and capital-structure assertions in STRICT."
-        )
+        st.divider()
+        st.markdown("## Directional Overlay (Executive Layer)")
 
-        colA, colB = st.columns(2)
-        with colA:
-            st.markdown(f"#### Claude ({claude_model})")
-            with st.spinner("Claude critiquing..."):
-                try:
-                    claude_out = call_claude(claude_model, mandate, judge_input)
-                except Exception as e:
-                    claude_out = f"❌ Claude Error: {str(e)}"
-            st.write(claude_out)
+        overlay_input = f"""
+STRICT OUTPUT:
+{strict_output}
 
-        with colB:
-            st.markdown(f"#### Grok ({grok_model})")
-            with st.spinner("Grok critiquing..."):
-                grok_out = call_grok(grok_model, mandate, judge_input)
-            st.write(grok_out)
+USER PROMPT:
+{prompt}
 
-        critiques.append({"orbit": orbit_name, "claude": claude_out, "grok": grok_out})
-
-    st.divider()
-    st.markdown("## Step 3 — Master Integration (Rev 1)")
-
-    with st.spinner("Master integrating critiques into Rev 1..."):
-        critique_blob = ""
-        for c in critiques:
-            critique_blob += f"\n\n=== ORBIT: {c['orbit']} ===\n\n--- Claude ---\n{c['claude']}\n\n--- Grok ---\n{c['grok']}\n"
-
-        rev1_input = (
-            f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
-            f"USER PROMPT:\n{user_text}\n\n"
-            f"{INPUT_LOCK_RULES}\n\n{CLAIMS_AUDIT_RULES}\n\n{PPA_CONSISTENCY_RULE}\n\n"
-            f"{CFADS_GUARDRAIL if STRICT_MODE else ''}\n\n"
-            f"{CAPITAL_STRUCTURE_GUARDRAIL if STRICT_MODE else ''}\n\n"
-            f"{mode_rules}\n\n{NO_INVENTION_STRUCTURES}\n\n"
-            f"REV 0:\n{rev0}\n\nCRITIQUES:\n{critique_blob}\n\n"
-            f"OUTPUT FORMAT:\n{MASTER_REV1_FORMAT}"
-        )
-        rev1 = call_openai(master_model, MASTER_REV1_SYSTEM, rev1_input)
-
-    st.markdown("### Rev 1 (Master)")
-    st.write(rev1)
-
-    # Step 4 — guardrail check + fix
-    st.divider()
-    st.markdown("## Step 4 — Guardrail Check (Auto-fix if needed)")
-
-    with st.spinner("Checking Rev 1 for guardrail violations..."):
-        check_input = (
-            f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
-            f"STRICT RULES:\n{STRICT_RULES if STRICT_MODE else '(not strict)'}\n\n"
-            f"CFADS GUARDRAIL:\n{CFADS_GUARDRAIL if STRICT_MODE else '(not strict)'}\n\n"
-            f"CAPITAL STRUCTURE GUARDRAIL:\n{CAPITAL_STRUCTURE_GUARDRAIL if STRICT_MODE else '(not strict)'}\n\n"
-            f"REV 1:\n{rev1}"
-        )
-        guardrail_report = call_openai("gpt-4o-mini", GUARDRAIL_CHECK_SYSTEM, check_input)
-
-    st.markdown("### Guardrail Report")
-    st.write(guardrail_report)
-
-    rev1_fixed = rev1
-    if "Should we regenerate Rev 1?\n- Yes" in guardrail_report:
-        with st.spinner("Auto-fixing Rev 1 (producing Rev 1b)..."):
-            fix_input = (
-                f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
-                f"VIOLATIONS REPORT:\n{guardrail_report}\n\n"
-                f"CURRENT REV 1:\n{rev1}\n\n"
-                f"USER PROMPT:\n{user_text}\n\n"
-                f"Return corrected Rev 1 only. Include Financing Treatment of Overrun with Case A/Case B."
-            )
-            rev1_fixed = call_openai(master_model, MASTER_FIX_SYSTEM, fix_input)
-
-        st.markdown("### Rev 1b (Corrected by Auto-fix)")
-        st.write(rev1_fixed)
-
-    # Export
-    export_text = f"""# Nemexis Export
-
-## MODE
-{'STRICT' if STRICT_MODE else 'BOUNDING'}
-
-## USER PROMPT
-{prompt.strip()}
-
-## CONTEXT
-{context.strip() if context.strip() else "(none)"}
-
----
-
-# REV 0 (Master)
-{rev0}
-
----
-
-# ORBIT CRITIQUES (Claude + Grok)
-"""
-    for c in critiques:
-        export_text += f"""
-
-## ORBIT: {c['orbit']}
-
-### Claude
-{c['claude']}
-
-### Grok
-{c['grok']}
+FORMAT:
+{OVERLAY_FORMAT}
 """
 
-    export_text += f"""
+        overlay_output = call_openai(
+            OVERLAY_SYSTEM,
+            overlay_input,
+            temperature=0.4
+        )
 
----
+        st.write(overlay_output)
 
-# REV 1 (Master)
-{rev1}
+        final_output = strict_output + "\n\n" + overlay_output
 
----
-
-# GUARDRAIL REPORT
-{guardrail_report}
-
----
-
-# REV 1b (Corrected)
-{rev1_fixed}
-"""
-
+    # ===============================
+    # Copy / Export Section
+    # ===============================
     st.divider()
     st.markdown("## Export")
-    copy_to_clipboard_button(export_text, "📋 Copy All")
+
+    export_text = f"""
+Nemexis v3 Export
+Generated: {datetime.datetime.now()}
+
+{final_output}
+"""
+
     st.download_button(
-        label="⬇️ Download as Markdown (.md)",
+        label="Download Full Output (.txt)",
         data=export_text,
-        file_name="nemexis_output.md",
-        mime="text/markdown",
+        file_name="nemexis_output.txt",
+        mime="text/plain"
     )
-    st.text_area("All output (easy Cmd/Ctrl+A then Copy)", value=export_text, height=320)
+
+    st.code(export_text)

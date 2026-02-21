@@ -7,7 +7,7 @@ import requests
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Nemexis", layout="wide")
-st.title("Nemexis — Reliability Engine (Iterative + Guardrails v3)")
+st.title("Nemexis — Reliability Engine (Iterative + Guardrails v4)")
 
 # ----------------------------
 # Password Gate
@@ -73,18 +73,16 @@ def copy_to_clipboard_button(text: str, button_label: str = "📋 Copy all outpu
 # UI
 # ----------------------------
 st.markdown("### Inputs")
-prompt = st.text_area("User Prompt", height=160, placeholder="What are you trying to solve / decide?")
-context = st.text_area("Context (optional)", height=160, placeholder="Paste numbers, excerpts, constraints, assumptions...")
+prompt = st.text_area("User Prompt", height=160)
+context = st.text_area("Context (optional)", height=160)
 
 st.markdown("### Settings")
 master_model = st.selectbox("Master model (OpenAI)", ["gpt-4o-mini", "gpt-4o"], index=0)
-
 claude_model = st.selectbox(
     "Claude judge model",
     ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"],
     index=0,
 )
-
 grok_model = st.selectbox("Grok judge model", ["grok-4-fast", "grok-4"], index=0)
 
 mode = st.radio(
@@ -92,8 +90,8 @@ mode = st.radio(
     ["Strict (no numeric assumptions, no derived numbers)", "Bounding (allow ranges + scenarios)"],
     index=0,
 )
-
 STRICT_MODE = mode.startswith("Strict")
+
 run = st.button("Run Nemexis (Rev 0 → Critiques → Rev 1 → Auto-fix)")
 
 # ----------------------------
@@ -101,17 +99,17 @@ run = st.button("Run Nemexis (Rev 0 → Critiques → Rev 1 → Auto-fix)")
 # ----------------------------
 ORBITS = [
     {"name": "Technical Engineering", "judge_mandate":
-        "You are a senior offshore/industrial engineering reviewer. "
-        "Critique technical correctness/realism, failure modes, unit sanity checks, schedule realism, "
-        "and technical-financial coupling mistakes. Do NOT rewrite; provide targeted fixes."
+        "You are a senior offshore/industrial engineering reviewer. Critique technical correctness/realism, "
+        "failure modes, unit sanity checks, schedule realism, and technical-financial coupling mistakes. "
+        "Do NOT rewrite; provide targeted fixes."
     },
     {"name": "Economics / Project Finance", "judge_mandate":
         "You are a project finance reviewer. Critique cash-flow logic, timing, covenants/DSCR, sensitivities, "
         "and math sanity checks. Do NOT invent numbers. Do NOT rewrite; provide targeted fixes."
     },
     {"name": "Contract / Legal (Commercial)", "judge_mandate":
-        "You are a contracts/commercial reviewer (delivery + procurement). Critique entitlement/pass-through, "
-        "LDs/caps, change orders, termination triggers, compliance/approvals, and what clauses must be checked. "
+        "You are a contracts/commercial reviewer. Critique entitlement/pass-through, LDs/caps, change orders, "
+        "termination triggers, compliance/approvals, and what clauses must be checked. "
         "Do NOT rewrite; provide targeted fixes."
     },
     {"name": "Risk / Governance", "judge_mandate":
@@ -132,7 +130,7 @@ INPUT LOCK:
 
 CLAIMS_AUDIT_RULES = """
 CLAIMS AUDIT:
-- Include a 'Claims Audit' section.
+- Include 'Claims Audit'.
 - Every numeric claim tagged: [Computed] [Estimated] [Assumed] [Unknown]
 - [Computed] only if you show enough calculation path to replicate.
 - Do NOT mark IRR as [Computed] unless you actually compute it from the cashflow logic you present.
@@ -143,13 +141,19 @@ PPA CONSISTENCY:
 - If PPA is fixed price, do NOT list 'PPA price volatility' as a risk unless you identify repricing/merchant exposure.
 """.strip()
 
+CFADS_GUARDRAIL = """
+CFADS / DSCR GUARDRAIL (STRICT):
+- DSCR is calculated on CFADS (Cash Flow Available for Debt Service), NOT EBITDA.
+- If only EBITDA is provided, you must treat DSCR headroom and debt capacity as [Unknown] unless CFADS bridge is provided.
+- You may NOT compute 'max debt capacity' or 'debt service' from EBITDA/DSCR in Strict mode.
+""".strip()
+
 STRICT_RULES = """
-STRICT MODE (very important):
+STRICT MODE:
 - You may NOT introduce new numeric assumptions (tax rate, O&M %, capacity factor, probabilities, escalation, etc.).
-- You may NOT introduce derived numeric outputs (e.g., Debt Service = EBITDA/DSCR) unless the underlying quantity is explicitly provided (CFADS) and method defined.
-- Treat DSCR as a covenant/constraint, NOT as a calculator for debt service.
-- If required numbers are missing, write [Unknown] and list them under Missing Inputs.
-- If you cannot compute the key decision metric (IRR below/above 8%), Confidence must be LOW.
+- You may NOT introduce derived numeric outputs unless all required underlying inputs are explicitly provided.
+- Treat DSCR as a covenant/constraint, NOT a calculator for debt service or debt capacity.
+- If key decision metric cannot be computed, Confidence must be LOW.
 """.strip()
 
 BOUNDING_RULES = """
@@ -169,13 +173,14 @@ NO INVENTED STRUCTURES:
 # Output formats
 # ----------------------------
 MASTER_REV0_SYSTEM = "You are Nemexis Master (OpenAI). Produce Rev 0 that is decision-grade. Follow guardrails strictly."
+
 MASTER_FORMAT = """
 Return in this exact structure:
 
 ## Inputs Used (Verbatim)
 
 ## Assumptions Added by Master
-(Strict mode: usually 'None' — instead list Unknowns)
+(Strict: usually None; instead list Unknowns)
 
 ## Executive Answer
 (5 bullets max)
@@ -190,6 +195,9 @@ Return in this exact structure:
 ## Contract / Legal Checks
 
 ## Missing Inputs (required)
+Split into:
+### Blocking (prevents answering Q1)
+### Non-blocking (nice-to-have)
 
 ## Claims Audit
 (tag each numeric claim)
@@ -210,6 +218,7 @@ Return critique:
 """.strip()
 
 MASTER_REV1_SYSTEM = "You are Nemexis Master (OpenAI) creating Rev 1. Integrate critiques; accept/reject with reasons; follow guardrails."
+
 MASTER_REV1_FORMAT = """
 Return:
 
@@ -224,12 +233,14 @@ Return:
 
 GUARDRAIL_CHECK_SYSTEM = """
 You are Nemexis Guardrail Checker.
-Your job: read Rev 1 and detect violations of:
+Detect violations of:
 - Strict mode rules (if strict)
 - Input Lock
 - Claims Audit (Computed without path)
-- DSCR misuse (e.g., using EBITDA/DSCR as debt service)
+- DSCR misuse (EBITDA used as CFADS / EBITDA/DSCR)
 - PPA consistency
+- Missing inputs not split into Blocking vs Non-blocking
+- Confidence not LOW when blocking inputs exist
 
 Output exactly:
 
@@ -244,12 +255,12 @@ Output exactly:
 """.strip()
 
 MASTER_FIX_SYSTEM = """
-You are Nemexis Master. You must correct Rev 1 to eliminate the listed violations.
+You are Nemexis Master. Correct Rev 1 to eliminate the listed violations.
 Rules:
-- Do not introduce new numeric assumptions in Strict mode.
-- Remove derived numbers not supported by inputs.
-- Downgrade confidence to Low if key metric cannot be computed.
-Return corrected Rev 1 only (no extra commentary).
+- In STRICT mode do not add numeric assumptions, do not compute debt capacity from EBITDA/DSCR, and do not label Computed without replicable path.
+- Ensure Missing Inputs is split into Blocking vs Non-blocking.
+- If Blocking inputs exist, Confidence must be LOW.
+Return corrected Rev 1 only.
 """.strip()
 
 # ----------------------------
@@ -289,7 +300,7 @@ def call_grok(model_name: str, system: str, user_text: str) -> str:
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_text}],
                     "temperature": 0.2,
                 },
-                timeout=120,  # increased
+                timeout=140,
             )
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"]
@@ -321,6 +332,7 @@ if run:
             f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
             f"USER PROMPT:\n{user_text}\n\n"
             f"{INPUT_LOCK_RULES}\n\n{CLAIMS_AUDIT_RULES}\n\n{PPA_CONSISTENCY_RULE}\n\n"
+            f"{CFADS_GUARDRAIL if STRICT_MODE else ''}\n\n"
             f"{mode_rules}\n\n{NO_INVENTION_STRUCTURES}\n\n"
             f"OUTPUT FORMAT:\n{MASTER_FORMAT}"
         )
@@ -343,7 +355,7 @@ if run:
             f"ORBIT: {orbit_name}\n\n"
             f"MASTER DRAFT (REV 0):\n{rev0}\n\n"
             f"CRITIQUE FORMAT:\n{JUDGE_FORMAT}\n\n"
-            f"Explicitly check for guardrail violations (Strict rules, DSCR misuse, Claims Audit issues)."
+            f"Explicitly check for guardrail violations, especially CFADS/DSCR misuse in STRICT."
         )
 
         colA, colB = st.columns(2)
@@ -376,6 +388,7 @@ if run:
             f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
             f"USER PROMPT:\n{user_text}\n\n"
             f"{INPUT_LOCK_RULES}\n\n{CLAIMS_AUDIT_RULES}\n\n{PPA_CONSISTENCY_RULE}\n\n"
+            f"{CFADS_GUARDRAIL if STRICT_MODE else ''}\n\n"
             f"{mode_rules}\n\n{NO_INVENTION_STRUCTURES}\n\n"
             f"REV 0:\n{rev0}\n\nCRITIQUES:\n{critique_blob}\n\n"
             f"OUTPUT FORMAT:\n{MASTER_REV1_FORMAT}"
@@ -395,6 +408,7 @@ if run:
         check_input = (
             f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}\n\n"
             f"STRICT RULES:\n{STRICT_RULES if STRICT_MODE else '(not strict)'}\n\n"
+            f"CFADS GUARDRAIL:\n{CFADS_GUARDRAIL if STRICT_MODE else '(not strict)'}\n\n"
             f"REV 1:\n{rev1}"
         )
         guardrail_report = call_openai("gpt-4o-mini", GUARDRAIL_CHECK_SYSTEM, check_input)
@@ -410,8 +424,7 @@ if run:
                 f"VIOLATIONS REPORT:\n{guardrail_report}\n\n"
                 f"CURRENT REV 1:\n{rev1}\n\n"
                 f"USER PROMPT:\n{user_text}\n\n"
-                f"Remember: in STRICT mode do not add numeric assumptions, do not misuse DSCR, "
-                f"and do not label Computed without a replicable path."
+                f"Remember: STRICT forbids CFADS/DSCR derived numbers from EBITDA, and Missing Inputs must be split blocking/non-blocking."
             )
             rev1_fixed = call_openai(master_model, MASTER_FIX_SYSTEM, fix_input)
 
@@ -452,6 +465,7 @@ if run:
 ### Grok
 {c['grok']}
 """
+
     export_text += f"""
 
 ---

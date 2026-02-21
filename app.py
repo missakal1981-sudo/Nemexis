@@ -3,6 +3,7 @@ import time
 import json
 import math
 import datetime
+import re
 import streamlit as st
 from openai import OpenAI
 import anthropic
@@ -10,8 +11,20 @@ import requests
 import streamlit.components.v1 as components
 from simpleeval import SimpleEval
 
-st.set_page_config(page_title="Nemexis", layout="wide")
-st.title("Nemexis — Universal Reliability Engine (v6 Safe + Math Verifier)")
+# ============================
+# Nemexis v7 — Accuracy-First Convergence
+# Goal (Mode A): Iterate until 0 blocking inputs remain AND all gates pass.
+# Gates:
+#  1) Deterministic math claims verified
+#  2) Guardrail checker: no violations
+#  3) Blocking inputs: NONE
+#  4) Claude & Grok: no critical must-fix items
+#
+# If cannot converge within max_iters, stop and report remaining blockers.
+# ============================
+
+st.set_page_config(page_title="Nemexis v7", layout="wide")
+st.title("Nemexis v7 — Accuracy-First Reliability Engine (0 Blocking Inputs)")
 
 # ----------------------------
 # Password Gate (optional)
@@ -82,12 +95,10 @@ def pmt(rate, nper, pv, fv=0.0, when=0):
     pv = float(pv)
     fv = float(fv)
     when = int(when)
-
     if nper <= 0:
         raise ValueError("nper must be > 0")
     if rate == 0:
         return -(pv + fv) / nper
-
     factor = (1 + rate) ** nper
     payment = -(rate * (pv * factor + fv)) / ((factor - 1) * (1 + rate * when))
     return payment
@@ -169,213 +180,89 @@ def verify_math_claims(claims_json: dict, rel_tol=1e-6, abs_tol=1.0):
         results.append(row)
     return results
 
-def render_math_verification(label: str, text: str):
-    st.markdown(f"### Math Verification — {label}")
-    json_block = extract_json_block(text)
-    if not json_block:
-        st.info("No Math Claims JSON block found.")
-        return None
-
+def math_gate_ok(text: str):
+    block = extract_json_block(text)
+    if not block:
+        return False, "No Math Claims JSON block"
     try:
-        claims = json.loads(json_block)
+        claims = json.loads(block)
     except Exception as e:
-        st.error(f"Could not parse Math Claims JSON: {e}")
-        st.code(json_block)
-        return None
-
+        return False, f"Math Claims JSON parse error: {e}"
     results = verify_math_claims(claims)
-    st.table(results)
-
-    mismatches = [r for r in results if r["error"] is None and r["expected"] is not None and r["ok"] is False]
-    errors = [r for r in results if r["error"] is not None]
-
-    if errors:
-        st.error("Math verifier encountered errors. Treat computed numbers as untrusted until fixed.")
-    elif mismatches:
-        st.error("Math mismatch detected. Treat computed numbers as untrusted until corrected.")
-    else:
-        st.success("All declared math claims verified ✅")
-
-    return {"claims": claims, "results": results}
+    # Any error or mismatch fails
+    for r in results:
+        if r["error"] is not None:
+            return False, f"Math verifier error in claim {r['id']}: {r['error']}"
+        if r["expected"] is not None and r["ok"] is False:
+            return False, f"Math mismatch in claim {r['id']}"
+    return True, results
 
 # ----------------------------
-# UI
+# Parse Blocking Inputs from Master output
 # ----------------------------
-st.markdown("### Inputs")
-prompt = st.text_area("User Prompt", height=180)
-context = st.text_area("Context (optional)", height=150)
+def parse_blocking_items(text: str):
+    """
+    Extract bullet lines under '## Missing Inputs' -> '### Blocking'
+    Returns list of strings.
+    """
+    # Find section
+    m = re.search(r"## Missing Inputs.*?### Blocking(.*?)(### Non-blocking|## Claims Audit|## Confidence|$)", text, flags=re.S | re.I)
+    if not m:
+        return ["(Missing Inputs/Blocking section not found)"]
 
-st.markdown("### Settings")
-master_model = st.selectbox("Master model (OpenAI)", ["gpt-4o-mini", "gpt-4o"], index=0)
-claude_model = st.selectbox(
-    "Claude judge model",
-    ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"],
-    index=0,
-)
-grok_model = st.selectbox("Grok judge model", ["grok-4-fast", "grok-4"], index=0)
+    block = m.group(1).strip()
+    if not block:
+        return []
 
-mode = st.radio(
-    "Assumptions mode",
-    ["Strict (no numeric assumptions, no derived numbers)", "Bounding (allow ranges + scenarios)"],
-    index=0,
-)
-STRICT_MODE = mode.startswith("Strict")
-run = st.button("Run Nemexis")
+    # If explicitly says None
+    if re.search(r"\bnone\b", block, flags=re.I):
+        # still could have bullets; treat as none only if no bullets
+        bullets = re.findall(r"^\s*-\s+(.*)$", block, flags=re.M)
+        if len(bullets) == 0:
+            return []
 
-ORBITS = [
-    {"name": "Technical Engineering", "judge_mandate":
-        "You are a senior engineering reviewer. Critique technical correctness/realism, failure modes, unit sanity checks, schedule realism."
-    },
-    {"name": "Economics / Project Finance", "judge_mandate":
-        "You are a project finance reviewer. Critique cash-flow logic, timing, covenants/DSCR, sensitivities, and math sanity checks. Do NOT invent numbers."
-    },
-    {"name": "Contract / Legal (Commercial)", "judge_mandate":
-        "You are a contracts/commercial reviewer. Critique entitlement/pass-through, LDs/caps, change orders, termination triggers, compliance/approvals."
-    },
-    {"name": "Risk / Governance", "judge_mandate":
-        "You are a risk officer. Critique ambiguity, overconfidence, missing assumptions, validation gaps. Provide a mini risk register."
-    },
-]
+    bullets = re.findall(r"^\s*-\s+(.*)$", block, flags=re.M)
+    # Also allow numbered items
+    nums = re.findall(r"^\s*\d+\.\s+(.*)$", block, flags=re.M)
+    items = [b.strip() for b in bullets + nums if b.strip()]
+    return items if items else ["(No bullet items found under Blocking)"]
 
-# Guardrails (strings built safely)
-INPUT_LOCK_RULES = "\n".join([
-    "INPUT LOCK:",
-    "- Include 'Inputs Used (Verbatim)' listing user inputs exactly.",
-    "- Include 'Assumptions Added by Master' for anything not provided.",
-    "- Do NOT silently change user inputs.",
-])
-
-CLAIMS_AUDIT_RULES = "\n".join([
-    "CLAIMS AUDIT:",
-    "- Include 'Claims Audit'.",
-    "- Every numeric claim tagged: [Known] [Computed] [Assumed] [Unknown]",
-    "- [Computed] only if you show enough calculation path to replicate.",
-    "- Do NOT mark IRR/DSCR as [Computed] unless you compute from explicit cashflows/schedules.",
-])
-
-CFADS_GUARDRAIL = "\n".join([
-    "CFADS / DSCR GUARDRAIL (STRICT):",
-    "- DSCR is based on CFADS, not EBITDA.",
-    "- If only EBITDA is provided, DSCR headroom and debt capacity are [Unknown] unless CFADS bridge provided.",
-    "- You may NOT compute debt service or max debt capacity from EBITDA/DSCR in Strict mode.",
-])
-
-CAPITAL_STRUCTURE_GUARDRAIL = "\n".join([
-    "CAPITAL STRUCTURE GUARDRAIL (STRICT):",
-    "- In Strict mode, you may NOT assert post-shock debt/equity funding as fact unless provided.",
-    "- You MUST present 'Financing Treatment of Shock/Overrun' with Case A and Case B.",
-])
-
-STRICT_RULES = "\n".join([
-    "STRICT MODE:",
-    "- No new numeric assumptions (tax rate, O&M %, capacity factor, probabilities, escalation, etc.).",
-    "- No derived numeric outputs unless underlying inputs are explicitly provided.",
-    "- If Blocking inputs exist, Confidence must be LOW.",
-    "- Avoid words like 'likely' for threshold crossings when key blocking inputs are missing.",
-])
-
-BOUNDING_RULES = "\n".join([
-    "BOUNDING MODE:",
-    "- You may add numeric assumptions only as ranges + scenario table.",
-    "- All added numeric assumptions tagged [Assumed] with brief basis.",
-])
-
-MASTER_SYSTEM = "You are Nemexis Master. Produce a decision-grade draft. Follow guardrails strictly."
-
-MASTER_FORMAT_LINES = [
-    "Return in this exact structure:",
-    "",
-    "## Inputs Used (Verbatim)",
-    "",
-    "## Assumptions Added by Master",
-    "",
-    "## Financing Treatment of Shock/Overrun (MANDATORY)",
-    "",
-    "## Executive Answer",
-    "",
-    "## Calculations / Logic",
-    "- Only compute what is computable from given inputs",
-    "",
-    "## Key Risks (ranked)",
-    "",
-    "## Contract / Legal Checks",
-    "",
-    "## Missing Inputs",
-    "### Blocking",
-    "### Non-blocking",
-    "",
-    "## Claims Audit",
-    "- Every numeric claim tagged [Known] [Computed] [Assumed] [Unknown]",
-    "",
-    "## Math Claims (JSON)",
-    "Provide a single JSON block enclosed with triple backticks. Example:",
-    "```json",
+# ----------------------------
+# Reviewer rubric (Claude/Grok) in JSON
+# ----------------------------
+RUBRIC_PROMPT = "\n".join([
+    "You are a reviewer. Critique the draft and output ONLY a JSON object.",
+    "Return exactly this JSON schema:",
     "{",
-    '  "claims": [',
-    "    {",
-    '      "id": "capex_overrun",',
-    '      "type": "arithmetic",',
-    '      "expr": "CAPEX*0.15",',
-    '      "inputs": {"CAPEX": 3200000000},',
-    '      "expected": 480000000,',
-    '      "units": "USD"',
-    "    }",
-    "  ]",
+    '  "overall_score_0_5": 0,',
+    '  "critical_must_fix": [],',
+    '  "blocking_inputs_remaining": [],',
+    '  "notes": ""',
     "}",
-    "```",
     "",
-    "Rules for Math Claims:",
-    "- Include ONLY claims you can compute from provided inputs.",
-    "- Do NOT include DSCR/CFADS/IRR unless you have explicit cashflows/schedules.",
-    "- expected must match what you state in prose.",
-    "",
-    "## Confidence",
-]
-MASTER_FORMAT = "\n".join(MASTER_FORMAT_LINES)
-
-JUDGE_FORMAT = "\n".join([
-    "Return critique:",
-    "## Summary Verdict",
-    "## Critical Issues (must-fix)",
-    "## Corrections / Fixes",
-    "## Missing Inputs (required)",
-    "## Questions for the Team",
-    "## Guardrail Violations Detected",
-    "## Confidence in Master Draft",
-])
-
-GUARDRAIL_CHECK_SYSTEM = "\n".join([
-    "You are Nemexis Guardrail Checker.",
-    "Detect violations of:",
-    "- Strict/Bounding rules",
-    "- Input Lock",
-    "- CFADS/DSCR misuse",
-    "- Funding mix asserted as fact in STRICT",
-    "- Missing Inputs not split Blocking/Non-blocking",
-    "- Confidence not LOW when Blocking inputs exist",
-    "- Math Claims JSON missing or inconsistent with prose",
-    "Output exactly:",
-    "## Violations Found",
-    "- bullet list (or 'None')",
-    "",
-    "## Required Corrections",
-    "- bullet list (or 'None')",
-    "",
-    "## Should we regenerate?",
-    "- Yes/No",
-])
-
-MASTER_FIX_SYSTEM = "\n".join([
-    "You are Nemexis Master. Rewrite the draft to remove violations.",
     "Rules:",
-    "- Do not add numeric assumptions in STRICT.",
-    "- Do not compute DSCR/CFADS from EBITDA.",
-    "- Do not assert funding mix as fact in STRICT; present Case A/Case B.",
-    "- Ensure Blocking vs Non-blocking missing inputs.",
-    "- Ensure Math Claims JSON exists and matches prose.",
-    "Return corrected draft only.",
+    "- overall_score_0_5 must be a number from 0 to 5.",
+    "- critical_must_fix: list of short bullets. Empty list means no must-fix.",
+    "- blocking_inputs_remaining: list of inputs that must be provided to reach a fully defensible answer.",
+    "- notes: 1–3 sentences max.",
+    "- Do not include any other text.",
 ])
 
+def parse_reviewer_json(text: str):
+    # Find first { ... } block heuristically
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None, "No JSON object found"
+    try:
+        obj = json.loads(text[start:end+1])
+        return obj, None
+    except Exception as e:
+        return None, str(e)
+
+# ----------------------------
+# Model calls
+# ----------------------------
 def call_openai(model_name: str, system: str, user_text: str, temperature=0.2) -> str:
     resp = openai_client.chat.completions.create(
         model=model_name,
@@ -387,7 +274,7 @@ def call_openai(model_name: str, system: str, user_text: str, temperature=0.2) -
 def call_claude(model_name: str, system: str, user_text: str) -> str:
     msg = anthropic_client.messages.create(
         model=model_name,
-        max_tokens=1800,
+        max_tokens=1600,
         temperature=0.2,
         system=system,
         messages=[{"role": "user", "content": user_text}],
@@ -420,6 +307,89 @@ def call_grok(model_name: str, system: str, user_text: str) -> str:
         time.sleep(1.5 * (attempt + 1))
     return last_err or "❌ Grok Error: unknown"
 
+# ----------------------------
+# Universal Strict instructions to Master
+# ----------------------------
+MASTER_SYSTEM = "\n".join([
+    "You are Nemexis Master (Accuracy-first).",
+    "You must produce an answer that can be accepted by an Investment Committee / technical board.",
+    "You must NOT invent missing numeric inputs.",
+    "Any number labeled [Computed] MUST be declared in Math Claims JSON and must verify deterministically.",
+    "If Blocking inputs remain, you must not claim threshold outcomes as 'likely'. You may say 'cannot determine'.",
+])
+
+MASTER_FORMAT = "\n".join([
+    "Return in this exact structure:",
+    "",
+    "## Inputs Used (Verbatim)",
+    "",
+    "## Assumptions Added by Master",
+    "",
+    "## Financing Treatment of Shock/Overrun (MANDATORY)",
+    "- Case A: Debt capped; overrun equity-funded.",
+    "- Case B: Debt upsized requires lender consent and CFADS/DSCR headroom.",
+    "",
+    "## Executive Answer",
+    "",
+    "## Calculations / Logic",
+    "",
+    "## Key Risks (ranked)",
+    "",
+    "## Contract / Legal Checks",
+    "",
+    "## Missing Inputs",
+    "### Blocking",
+    "### Non-blocking",
+    "",
+    "## Claims Audit",
+    "",
+    "## Math Claims (JSON)",
+    "Provide a single JSON block with triple backticks like:",
+    "```json",
+    "{",
+    '  "claims": [',
+    "    {",
+    '      "id": "capex_overrun",',
+    '      "type": "arithmetic",',
+    '      "expr": "CAPEX*0.15",',
+    '      "inputs": {"CAPEX": 3200000000},',
+    '      "expected": 480000000,',
+    '      "units": "USD"',
+    "    }",
+    "  ]",
+    "}",
+    "```",
+    "",
+    "Rules for Math Claims:",
+    "- Include ONLY claims computable from provided inputs.",
+    "- Do NOT include DSCR/CFADS/IRR unless explicit cashflows/schedules are provided.",
+    "",
+    "## Confidence",
+    "- Must be LOW if Blocking inputs exist.",
+])
+
+# ----------------------------
+# UI
+# ----------------------------
+st.markdown("### Inputs")
+prompt = st.text_area("User Prompt", height=180)
+context = st.text_area("Context (optional)", height=150)
+
+st.markdown("### Settings")
+master_model = st.selectbox("Master model (OpenAI)", ["gpt-4o-mini", "gpt-4o"], index=0)
+claude_model = st.selectbox(
+    "Claude critic model",
+    ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"],
+    index=0,
+)
+grok_model = st.selectbox("Grok critic model", ["grok-4-fast", "grok-4"], index=0)
+
+max_iters = st.slider("Max iterations", min_value=2, max_value=10, value=5)
+run = st.button("Run Nemexis (iterate to 0 blocking inputs)")
+
+# ----------------------------
+# Main loop
+# ----------------------------
 if run:
     if not prompt.strip():
         st.error("Please enter a User Prompt.")
@@ -429,134 +399,141 @@ if run:
     if context.strip():
         user_text += "\n\n---\nContext:\n" + context.strip()
 
-    mode_rules = STRICT_RULES if STRICT_MODE else BOUNDING_RULES
+    history = []
+    converged = False
+    remaining_blockers = None
+    final_draft = None
+    final_reviews = None
+    final_math = None
 
     st.divider()
-    st.markdown("## Step 1 — Master Draft (Rev 0)")
+    st.markdown("## Iterations")
 
-    rev0_input = "\n\n".join([
-        f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}",
-        "USER PROMPT:",
-        user_text,
-        INPUT_LOCK_RULES,
-        CLAIMS_AUDIT_RULES,
-        CFADS_GUARDRAIL if STRICT_MODE else "",
-        CAPITAL_STRUCTURE_GUARDRAIL if STRICT_MODE else "",
-        mode_rules,
-        "OUTPUT FORMAT:",
-        MASTER_FORMAT
-    ])
+    for it in range(1, max_iters + 1):
+        st.markdown(f"### Iteration {it}")
 
-    with st.spinner("Master generating Rev 0..."):
-        rev0 = call_openai(master_model, MASTER_SYSTEM, rev0_input, temperature=0.15)
+        # Draft prompt includes last critiques if present
+        last_feedback = ""
+        if history:
+            last = history[-1]
+            last_feedback = "\n\n".join([
+                "PREVIOUS ITERATION FEEDBACK (must address):",
+                f"- Blocking inputs remaining: {last['blocking']}",
+                f"- Claude critical must-fix: {last['claude']['critical_must_fix']}",
+                f"- Grok critical must-fix: {last['grok']['critical_must_fix']}",
+                "Fix any math-claim inconsistencies and ensure Math Claims JSON matches prose.",
+            ])
 
-    st.markdown("### Rev 0 (Master)")
-    st.write(rev0)
-    math0 = render_math_verification("Rev 0", rev0)
-
-    st.divider()
-    st.markdown("## Step 2 — Orbit Critiques (Claude + Grok)")
-
-    critiques = []
-    for orbit in ORBITS:
-        orbit_name = orbit["name"]
-        mandate = orbit["judge_mandate"]
-
-        judge_input = "\n\n".join([
-            f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}",
-            f"ORBIT: {orbit_name}",
-            "MASTER DRAFT (REV 0):",
-            rev0,
-            "CRITIQUE FORMAT:",
-            JUDGE_FORMAT,
-            "Also check: math structure (formulas/definitions), claims audit integrity, missing inputs classification."
-        ])
-
-        colA, colB = st.columns(2)
-        with colA:
-            st.markdown(f"#### Claude ({claude_model})")
-            with st.spinner("Claude critiquing..."):
-                claude_out = call_claude(claude_model, mandate, judge_input)
-            st.write(claude_out)
-
-        with colB:
-            st.markdown(f"#### Grok ({grok_model})")
-            with st.spinner("Grok critiquing..."):
-                grok_out = call_grok(grok_model, mandate, judge_input)
-            st.write(grok_out)
-
-        critiques.append({"orbit": orbit_name, "claude": claude_out, "grok": grok_out})
-
-    st.divider()
-    st.markdown("## Step 3 — Master Integration (Rev 1)")
-
-    critique_blob = ""
-    for c in critiques:
-        critique_blob += f"\n\n=== ORBIT: {c['orbit']} ===\n\n--- Claude ---\n{c['claude']}\n\n--- Grok ---\n{c['grok']}\n"
-
-    rev1_input = "\n\n".join([
-        f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}",
-        "USER PROMPT:",
-        user_text,
-        INPUT_LOCK_RULES,
-        CLAIMS_AUDIT_RULES,
-        CFADS_GUARDRAIL if STRICT_MODE else "",
-        CAPITAL_STRUCTURE_GUARDRAIL if STRICT_MODE else "",
-        mode_rules,
-        "REV 0:",
-        rev0,
-        "CRITIQUES:",
-        critique_blob,
-        "OUTPUT FORMAT:",
-        MASTER_FORMAT
-    ])
-
-    with st.spinner("Master generating Rev 1..."):
-        rev1 = call_openai(master_model, MASTER_SYSTEM, rev1_input, temperature=0.15)
-
-    st.markdown("### Rev 1 (Master)")
-    st.write(rev1)
-    math1 = render_math_verification("Rev 1", rev1)
-
-    st.divider()
-    st.markdown("## Step 4 — Guardrail Check + Auto-fix (Rev 1b)")
-
-    check_input = "\n\n".join([
-        f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}",
-        "REV 1:",
-        rev1,
-        "RULES:",
-        mode_rules,
-        "Check Math Claims JSON presence and consistency with prose."
-    ])
-
-    with st.spinner("Guardrail checker reviewing Rev 1..."):
-        guardrail_report = call_openai("gpt-4o-mini", GUARDRAIL_CHECK_SYSTEM, check_input, temperature=0.0)
-
-    st.markdown("### Guardrail Report")
-    st.write(guardrail_report)
-
-    rev1b = rev1
-    if "Should we regenerate?\n- Yes" in guardrail_report:
-        fix_input = "\n\n".join([
-            f"MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}",
-            "VIOLATIONS REPORT:",
-            guardrail_report,
-            "CURRENT REV 1:",
-            rev1,
+        master_input = "\n\n".join([
             "USER PROMPT:",
-            user_text
+            user_text,
+            last_feedback,
+            "OUTPUT FORMAT:",
+            MASTER_FORMAT
         ])
-        with st.spinner("Auto-fixing → generating Rev 1b..."):
-            rev1b = call_openai(master_model, MASTER_FIX_SYSTEM, fix_input, temperature=0.1)
 
-    st.markdown("### Rev 1b (Corrected)")
-    st.write(rev1b)
-    math1b = render_math_verification("Rev 1b", rev1b)
+        with st.spinner("Master drafting..."):
+            draft = call_openai(master_model, MASTER_SYSTEM, master_input, temperature=0.15)
 
+        st.write(draft)
+
+        # Gate 1: parse blocking inputs
+        blocking = parse_blocking_items(draft)
+
+        # Gate 2: math claims verified
+        math_ok, math_info = math_gate_ok(draft)
+
+        # Reviewers: Claude + Grok rubric JSON
+        with st.spinner("Claude scoring..."):
+            claude_review_raw = call_claude(claude_model, "You are a strict reviewer.", draft + "\n\n" + RUBRIC_PROMPT)
+        claude_obj, claude_err = parse_reviewer_json(claude_review_raw)
+        if claude_obj is None:
+            claude_obj = {"overall_score_0_5": 0, "critical_must_fix": ["Could not parse Claude JSON"], "blocking_inputs_remaining": [], "notes": claude_err or ""}
+
+        with st.spinner("Grok scoring..."):
+            grok_review_raw = call_grok(grok_model, "You are a strict reviewer.", draft + "\n\n" + RUBRIC_PROMPT)
+        grok_obj, grok_err = parse_reviewer_json(grok_review_raw)
+        if grok_obj is None:
+            grok_obj = {"overall_score_0_5": 0, "critical_must_fix": ["Could not parse Grok JSON"], "blocking_inputs_remaining": [], "notes": grok_err or ""}
+
+        st.markdown("**Claude rubric:**")
+        st.json(claude_obj)
+        st.markdown("**Grok rubric:**")
+        st.json(grok_obj)
+
+        # Convergence rule (Mode A)
+        # - blocking must be empty or explicitly 'None'
+        blocking_is_zero = (len(blocking) == 0) or (len(blocking) == 1 and "not found" not in blocking[0].lower() and "no bullet" not in blocking[0].lower() and blocking[0].strip().lower() == "none")
+        # Also treat "(...not found)" as not converged
+        if len(blocking) == 1 and blocking[0].startswith("("):
+            blocking_is_zero = False
+
+        no_critical = (len(claude_obj.get("critical_must_fix", [])) == 0) and (len(grok_obj.get("critical_must_fix", [])) == 0)
+
+        # Store iteration record
+        history.append({
+            "iter": it,
+            "draft": draft,
+            "blocking": blocking,
+            "math_ok": math_ok,
+            "math_info": math_info,
+            "claude": claude_obj,
+            "grok": grok_obj,
+        })
+
+        # Display gate status
+        st.markdown("#### Gate Status")
+        st.write({
+            "blocking_inputs": blocking,
+            "math_verified": math_ok,
+            "no_critical_must_fix": no_critical,
+        })
+
+        # Decide stop/continue
+        if blocking_is_zero and math_ok and no_critical:
+            converged = True
+            final_draft = draft
+            final_reviews = {"claude": claude_obj, "grok": grok_obj}
+            final_math = math_info
+            remaining_blockers = []
+            break
+        else:
+            final_draft = draft
+            final_reviews = {"claude": claude_obj, "grok": grok_obj}
+            final_math = math_info
+            remaining_blockers = blocking
+
+            # If blocking inputs exist, we cannot “iterate them away” without user data.
+            # So we stop early and tell the user what is needed.
+            if not blocking_is_zero:
+                st.warning("Cannot reach 0 blocking inputs without additional data. Stopping early to avoid meaningless looping.")
+                break
+
+    st.divider()
+    st.markdown("## Final Result")
+
+    if converged:
+        st.success("✅ Converged: 0 blocking inputs + math verified + no critical must-fix.")
+    else:
+        st.error("❌ Not converged to 0 blocking inputs.")
+        st.write("Remaining blocking inputs:", remaining_blockers)
+
+    st.markdown("### Final Draft")
+    st.write(final_draft)
+
+    st.markdown("### Final Math Verification")
+    if isinstance(final_math, list):
+        st.table(final_math)
+    else:
+        st.write(final_math)
+
+    st.markdown("### Final Reviewer Rubrics")
+    st.json(final_reviews)
+
+    # Export
     export_text = f"""# Nemexis Export
 Generated: {datetime.datetime.now()}
-MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}
+Mode: Accuracy-first (0 Blocking Inputs)
 
 ## USER PROMPT
 {prompt.strip()}
@@ -564,44 +541,37 @@ MODE: {'STRICT' if STRICT_MODE else 'BOUNDING'}
 ## CONTEXT
 {context.strip() if context.strip() else "(none)"}
 
----
+## CONVERGED
+{converged}
 
-# REV 0
-{rev0}
-
----
-
-# REV 1
-{rev1}
+## REMAINING BLOCKERS
+{remaining_blockers}
 
 ---
 
-# GUARDRAIL REPORT
-{guardrail_report}
+## FINAL DRAFT
+{final_draft}
 
 ---
 
-# REV 1b
-{rev1b}
+## FINAL REVIEWS
+{json.dumps(final_reviews, indent=2)}
 
 ---
 
-# CRITIQUES
+## HISTORY
 """
-    for c in critiques:
-        export_text += f"""
-
-## ORBIT: {c['orbit']}
-
-### Claude
-{c['claude']}
-
-### Grok
-{c['grok']}
-"""
+    for h in history:
+        export_text += f"\n\n### Iteration {h['iter']}\n"
+        export_text += f"- Blocking: {h['blocking']}\n"
+        export_text += f"- Math OK: {h['math_ok']}\n"
+        export_text += f"- Claude critical: {h['claude'].get('critical_must_fix', [])}\n"
+        export_text += f"- Grok critical: {h['grok'].get('critical_must_fix', [])}\n"
+        export_text += "\n---\n"
+        export_text += h["draft"]
 
     st.divider()
     st.markdown("## Export")
     copy_to_clipboard_button(export_text, "📋 Copy Everything")
-    st.download_button("⬇️ Download as Markdown (.md)", export_text, file_name="nemexis_output.md")
+    st.download_button("⬇️ Download Markdown", export_text, file_name="nemexis_output.md", mime="text/markdown")
     st.text_area("All output (Cmd/Ctrl+A then Copy)", value=export_text, height=320)

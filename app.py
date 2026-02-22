@@ -11,11 +11,11 @@ import requests
 import streamlit.components.v1 as components
 from simpleeval import SimpleEval
 
-st.set_page_config(page_title="Nemexis v10.1", layout="wide")
-st.title("Nemexis v10.1 — STRICT/ASSUMPTION + Multi-Leader + Deterministic Math (Tolerance + Fenced JSON)")
+st.set_page_config(page_title="Nemexis v10.2", layout="wide")
+st.title("Nemexis v10.2 — Best-Iteration + Final Synthesis (Math-Verified)")
 
 # ----------------------------
-# Load secrets
+# Secrets
 # ----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
@@ -89,12 +89,10 @@ def pmt(rate, nper, pv, fv=0.0, when=0):
     pv = float(pv)
     fv = float(fv)
     when = int(when)
-
     if nper <= 0:
         raise ValueError("nper must be > 0")
     if rate == 0:
         return -(pv + fv) / nper
-
     factor = (1 + rate) ** nper
     payment = -(rate * (pv * factor + fv)) / ((factor - 1) * (1 + rate * when))
     return payment
@@ -122,7 +120,7 @@ def irr(cashflows, guess=0.1, max_iter=100, tol=1e-7):
     raise ValueError("IRR did not converge")
 
 # ----------------------------
-# Math Claims schema enforcement
+# Math Claims parsing/verification
 # ----------------------------
 def extract_json_block(text: str) -> str | None:
     marker = "```json"
@@ -142,7 +140,6 @@ def validate_math_claims_schema(claims_json: dict):
         return False, "Math Claims JSON is not an object"
     if "claims" not in claims_json or not isinstance(claims_json["claims"], list):
         return False, "Math Claims JSON must contain 'claims' as a list"
-
     for i, c in enumerate(claims_json["claims"]):
         if not isinstance(c, dict):
             return False, f"Claim #{i} is not an object"
@@ -152,35 +149,29 @@ def validate_math_claims_schema(claims_json: dict):
         ctype = c["type"]
         if ctype not in ["arithmetic", "pmt", "npv", "irr"]:
             return False, f"Claim #{i} invalid type '{ctype}'"
-
         if ctype == "arithmetic":
             if "expr" not in c:
                 return False, f"Arithmetic claim #{i} missing 'expr'"
             if not isinstance(c["inputs"], dict):
                 return False, f"Arithmetic claim #{i} inputs must be object"
         elif ctype == "pmt":
-            required = {"rate", "nper", "pv"}
-            if not required.issubset(set(c["inputs"].keys())):
-                return False, f"PMT claim #{i} inputs must include {sorted(list(required))}"
+            req = {"rate", "nper", "pv"}
+            if not req.issubset(set(c["inputs"].keys())):
+                return False, f"PMT claim #{i} inputs must include {sorted(list(req))}"
         elif ctype == "npv":
-            required = {"rate", "cashflows"}
-            if not required.issubset(set(c["inputs"].keys())):
-                return False, f"NPV claim #{i} inputs must include {sorted(list(required))}"
+            req = {"rate", "cashflows"}
+            if not req.issubset(set(c["inputs"].keys())):
+                return False, f"NPV claim #{i} inputs must include {sorted(list(req))}"
         elif ctype == "irr":
-            required = {"cashflows"}
-            if not required.issubset(set(c["inputs"].keys())):
-                return False, f"IRR claim #{i} inputs must include {sorted(list(required))}"
+            req = {"cashflows"}
+            if not req.issubset(set(c["inputs"].keys())):
+                return False, f"IRR claim #{i} inputs must include {sorted(list(req))}"
     return True, "OK"
 
 def _tolerances_for_units(units: str):
-    """
-    Per-unit tolerance policy.
-    - USD / USD_per_year: allow +/- $1,000,000 (rounding OK)
-    - ratio / % / others: keep strict-ish
-    """
     u = (units or "").lower()
     if "usd" in u:
-        return 1e-6, 1_000_000.0  # rel_tol, abs_tol
+        return 1e-6, 1_000_000.0  # allow rounding to ~$1M
     if "ratio" in u:
         return 1e-6, 1e-6
     if "%" in u or "percent" in u:
@@ -198,7 +189,6 @@ def verify_math_claims(claims_json: dict):
         units = c.get("units", "")
 
         row = {"id": cid, "type": ctype, "units": units, "ok": False, "expected": expected, "computed": None, "error": None}
-
         try:
             if ctype == "arithmetic":
                 se = SimpleEval()
@@ -211,8 +201,7 @@ def verify_math_claims(claims_json: dict):
             elif ctype == "irr":
                 computed = irr(**inputs)
             else:
-                raise ValueError(f"Unknown claim type: {ctype}")
-
+                raise ValueError("Unknown claim type")
             row["computed"] = computed
 
             if expected is None:
@@ -220,12 +209,9 @@ def verify_math_claims(claims_json: dict):
             else:
                 rel_tol, abs_tol = _tolerances_for_units(units)
                 row["ok"] = math.isclose(float(computed), float(expected), rel_tol=rel_tol, abs_tol=abs_tol)
-
         except Exception as e:
             row["error"] = str(e)
-
         results.append(row)
-
     return results
 
 def math_gate_ok(text: str):
@@ -236,11 +222,9 @@ def math_gate_ok(text: str):
         claims = json.loads(block)
     except Exception as e:
         return False, f"Math Claims JSON parse error: {e}"
-
     ok_schema, msg = validate_math_claims_schema(claims)
     if not ok_schema:
         return False, f"Math Claims schema error: {msg}"
-
     results = verify_math_claims(claims)
     for r in results:
         if r["error"] is not None:
@@ -252,7 +236,7 @@ def math_gate_ok(text: str):
 def render_math_table(text: str, title: str):
     st.markdown(f"### Math Verification — {title}")
     ok, info = math_gate_ok(text)
-    if ok is True and isinstance(info, list):
+    if ok and isinstance(info, list):
         st.table(info)
         st.success("Math verified ✅")
     else:
@@ -260,7 +244,7 @@ def render_math_table(text: str, title: str):
     return ok, info
 
 # ----------------------------
-# Blocking inputs parsing
+# Blocking parsing (treat "None" as empty)
 # ----------------------------
 def parse_blocking_items(text: str):
     m = re.search(r"## Missing Inputs.*?### Blocking(.*?)(### Non-blocking|## Claims Audit|## Confidence|## Math Claims|$)", text, flags=re.S | re.I)
@@ -269,12 +253,14 @@ def parse_blocking_items(text: str):
     block = m.group(1).strip()
     if not block:
         return []
+    if re.fullmatch(r"(?is)\s*none\s*", block):
+        return []
     bullets = re.findall(r"^\s*-\s+(.*)$", block, flags=re.M)
     nums = re.findall(r"^\s*\d+\.\s+(.*)$", block, flags=re.M)
     items = [x.strip() for x in (bullets + nums) if x.strip()]
-    if not items and re.search(r"\bnone\b", block, flags=re.I):
+    if len(items) == 1 and items[0].strip().lower() == "none":
         return []
-    return items if items else ["(No bullet items found under Blocking)"]
+    return items
 
 # ----------------------------
 # Model calls
@@ -359,8 +345,13 @@ def leader_call(system: str, user_text: str, temperature=0.2):
     return call_grok(grok_model, system, user_text)
 
 # ----------------------------
-# Assumption pack
+# UI: Problem
 # ----------------------------
+st.markdown("### Problem")
+user_prompt = st.text_area("Prompt", height=220)
+user_context = st.text_area("Context (optional)", height=140)
+blocker_input = st.text_area("Provide missing inputs (optional)", height=120)
+
 DEFAULT_ASSUMPTION_PACK = "\n".join([
     "Finance assumptions (use ranges; tag each [Assumed]):",
     "- CAPEX phasing: Year1 30%, Year2 40%, Year3 30%",
@@ -368,19 +359,15 @@ DEFAULT_ASSUMPTION_PACK = "\n".join([
     "- Debt amortization: if sculpting schedule missing, use level PMT",
     "- O&M: 1–4% of CAPEX per year (use sensitivity)",
     "- Taxes: 0–30% effective (use sensitivity)",
-    "- CFADS bridge: CFADS = EBITDA - O&M - taxes - reserves (define reserves if used)",
+    "- Reserves: 0–5% of EBITDA",
+    "- CFADS bridge: CFADS = EBITDA - O&M - taxes - reserves",
     "",
     "Technical assumptions (use ranges; tag each [Assumed]):",
     "- Availability: 92–98%",
-    "- Capacity factor: 40–55% (if required for revenue cross-check)",
-    "- Delay range: 0–12 months (if modeling schedule impacts)",
-    "- Top failure modes for offshore wind: (i) geotech/foundations, (ii) marine logistics/weather/vessels, (iii) cables/interconnection",
+    "- Capacity factor: 40–55%",
+    "- Delay range: 0–12 months",
+    "- Failure modes for offshore wind: (i) geotech/foundations, (ii) vessels/weather/logistics, (iii) cables/interconnection",
 ])
-
-st.markdown("### Problem")
-user_prompt = st.text_area("Prompt", height=220)
-user_context = st.text_area("Context (optional)", height=140)
-blocker_input = st.text_area("Provide missing inputs (optional)", height=120)
 
 st.markdown("### Assumption Pack (used only in ASSUMPTION)")
 assumption_pack = st.text_area("Assumption Pack", value=DEFAULT_ASSUMPTION_PACK, height=220)
@@ -391,10 +378,10 @@ with colA:
 with colB:
     run_assume = st.button("Run ASSUMPTION")
 
-max_iters = st.slider("ASSUMPTION iterations", 1, 6, 3)
+max_iters = st.slider("ASSUMPTION iterations", 2, 8, 4)
 
 # ----------------------------
-# Master prompts
+# Master prompts: ban inline JSON in narrative + single JSON block at end
 # ----------------------------
 MASTER_FORMAT = "\n".join([
     "Return in this exact structure:",
@@ -402,17 +389,18 @@ MASTER_FORMAT = "\n".join([
     "## Mode Banner",
     "",
     "## Inputs Used (Verbatim)",
-    "- List bullet key-value items ONLY (do not paste the whole prompt).",
+    "- Bullet list of key-value facts only.",
     "",
     "## Assumptions Added by Master",
     "",
     "## Financing Treatment of Shock/Overrun (MANDATORY)",
-    "- Case A (Debt capped): debt stays at base; overrun equity-funded (equity = base equity + overrun).",
-    "- Case B (Pro-rata 60/40): debt += 0.6*overrun; equity += 0.4*overrun.",
+    "- Case A: debt stays at base; equity = base equity + overrun.",
+    "- Case B: debt += 0.6*overrun; equity += 0.4*overrun.",
     "",
     "## Executive Answer",
     "",
     "## Calculations / Logic",
+    "- NO inline JSON examples. Do not include any code blocks except the single Math Claims JSON block.",
     "",
     "## Key Risks (ranked)",
     "",
@@ -425,7 +413,8 @@ MASTER_FORMAT = "\n".join([
     "## Claims Audit",
     "",
     "## Math Claims (JSON)",
-    "Provide exactly one JSON block in this schema:",
+    "Provide exactly ONE fenced JSON block. No other JSON blocks anywhere.",
+    "Schema:",
     "```json",
     "{",
     '  "claims": [',
@@ -441,25 +430,28 @@ MASTER_FORMAT = "\n".join([
     "}",
     "```",
     "",
-    "PMT claim inputs MUST use keys: rate (decimal), nper, pv.",
+    "Rules:",
+    "- Use type=pmt with inputs keys: rate (decimal), nper, pv.",
+    "- Do not use arithmetic expr to call PMT().",
+    "- expected may be rounded; verifier allows +/- $1M for USD units.",
+    "",
     "## Confidence",
 ])
 
 MASTER_SYSTEM_STRICT = "\n".join([
     "You are Nemexis Master (STRICT).",
-    "Rules:",
     "- Do NOT add numeric assumptions.",
     "- If blocking inputs exist, do NOT state threshold outcomes as likely; say cannot determine.",
-    "- Any computed number must be backed by Math Claims JSON (schema must be valid and fenced).",
+    "- Any computed number must be backed by Math Claims JSON (valid, fenced, schema-compliant).",
 ])
 
 MASTER_SYSTEM_ASSUME = "\n".join([
     "You are Nemexis Master (ASSUMPTION MODE).",
-    "Rules:",
-    "- Use the Assumption Pack to fill missing values; tag each [Assumed]. Prefer ranges + sensitivity.",
-    "- Case A: debt stays at base; equity = base equity + overrun (NOT 40% of total).",
-    "- Case B: debt += 0.6*overrun; equity += 0.4*overrun.",
-    "- Any computed number must be backed by a fenced Math Claims JSON block with VALID schema.",
+    "- Use the Assumption Pack to fill missing values; tag each [Assumed] (prefer ranges + sensitivity).",
+    "- Enforce Case A/Case B definitions exactly.",
+    "- Provide PMT claims as type=pmt with correct inputs schema.",
+    "- Provide only one fenced JSON block (Math Claims).",
+    "- In ASSUMPTION mode, Blocking should be NONE unless truly impossible.",
 ])
 
 def build_user_text():
@@ -489,19 +481,16 @@ def run_master_assume(feedback: str):
     ])
     return leader_call(MASTER_SYSTEM_ASSUME, master_input, temperature=0.25)
 
-def ensure_fenced_json(draft_fn, max_tries=2, title=""):
-    """
-    Calls draft_fn() up to max_tries until we see a fenced json block.
-    """
+def ensure_fenced_json(draft_fn, max_tries=2):
     last = None
-    for attempt in range(1, max_tries + 1):
+    for _ in range(max_tries):
         last = draft_fn()
         if extract_json_block(last) is not None:
-            return last, attempt, None
-    return last, max_tries, "Missing fenced ```json``` block after retries"
+            return last, None
+    return last, "Missing fenced ```json``` block after retries"
 
 # ----------------------------
-# STRICT run (auto retry once if json fence or math fails)
+# STRICT
 # ----------------------------
 if run_strict:
     if not user_prompt.strip():
@@ -511,30 +500,19 @@ if run_strict:
     st.divider()
     st.markdown("## STRICT Result")
 
-    def strict_call():
-        return run_master_strict()
-
-    draft, tries, fence_err = ensure_fenced_json(strict_call, max_tries=2)
+    draft, fence_err = ensure_fenced_json(run_master_strict, max_tries=2)
     if fence_err:
         st.error(fence_err)
 
-    ok_math, _ = render_math_table(draft, f"STRICT (try {tries})")
-    if not ok_math:
-        st.warning("STRICT math failed. Auto-retrying once more…")
-        draft2, tries2, fence_err2 = ensure_fenced_json(strict_call, max_tries=2)
-        if fence_err2:
-            st.error(fence_err2)
-        ok_math2, _ = render_math_table(draft2, f"STRICT retry (try {tries2})")
-        draft = draft2
-        ok_math = ok_math2
-
+    ok_math, _ = render_math_table(draft, "STRICT")
     st.write(draft)
+
     blockers = parse_blocking_items(draft)
     st.markdown("### Blocking inputs")
     st.write(blockers if blockers else ["None"])
 
 # ----------------------------
-# ASSUMPTION iterative (schema enforced + fenced json enforced)
+# ASSUMPTION: iterative + best-valid + final synthesis
 # ----------------------------
 if run_assume:
     if not user_prompt.strip():
@@ -542,10 +520,12 @@ if run_assume:
         st.stop()
 
     st.divider()
-    st.markdown("## ASSUMPTION Result (iterative)")
+    st.markdown("## ASSUMPTION (iterative)")
 
     history = []
-    final = None
+    best_valid = None
+    best_valid_iter = None
+    best_valid_math = None
 
     for it in range(1, max_iters + 1):
         st.markdown(f"### Iteration {it}")
@@ -557,57 +537,147 @@ if run_assume:
                 "PREVIOUS ITERATION MUST-FIX:",
                 f"- Math OK: {prev['math_ok']}",
                 f"- Blocking inputs: {prev['blockers']}",
-                f"- Issues: {prev['issues']}",
+                f"- Math failure reason: {prev['math_fail_reason']}",
                 "",
-                "Rules:",
-                "- Math Claims JSON must be fenced and valid schema and match prose.",
-                "- Fix Case A / Case B definitions (Case A equity = base equity + overrun).",
-                "- In ASSUMPTION mode, Blocking should be NONE (fill gaps explicitly).",
-                "- For PMT claims, use inputs keys: rate,nper,pv. rate must be decimal (0.065).",
+                "Hard rules:",
+                "- One fenced Math Claims JSON block only.",
+                "- PMT must be type=pmt (not arithmetic).",
+                "- Case A equity = base equity + overrun. Case B equity = base equity + 0.4*overrun; debt = base debt + 0.6*overrun.",
+                "- Blocking must be NONE in ASSUMPTION mode (fill gaps).",
             ])
 
-        def assume_call():
+        def draft_call():
             return run_master_assume(feedback)
 
-        draft, tries, fence_err = ensure_fenced_json(assume_call, max_tries=2, title=f"ASSUMPTION iter {it}")
+        draft, fence_err = ensure_fenced_json(draft_call, max_tries=2)
         if fence_err:
             st.error(f"[Iter {it}] {fence_err}")
 
         st.write(draft)
 
-        ok_math, _ = render_math_table(draft, f"ASSUMPTION iter {it} (try {tries})")
+        ok_math, math_info = math_gate_ok(draft)
+        if ok_math:
+            st.success("Math verified ✅")
+            st.table(math_info)
+        else:
+            st.error(f"Math failed: {math_info}")
+
         blockers = parse_blocking_items(draft)
+        blockers_empty = (len(blockers) == 0)
 
-        issues = []
-        if blockers:
-            issues.append("Blocking inputs remain")
-        if not ok_math:
-            issues.append("Math schema/verification failed")
-
+        # store
         history.append({
             "iter": it,
             "draft": draft,
             "math_ok": ok_math,
+            "math_fail_reason": None if ok_math else str(math_info),
             "blockers": blockers,
-            "issues": issues
+            "blockers_empty": blockers_empty,
         })
 
-        blockers_empty = (len(blockers) == 0)
+        # track best valid
         if ok_math and blockers_empty:
-            st.success("✅ Converged (math verified + no blocking inputs).")
-            final = draft
-            break
+            best_valid = draft
+            best_valid_iter = it
+            best_valid_math = math_info
+            break  # we can stop early on success
 
-        final = draft
+        # if ok_math but blockers not empty, still track as "best so far" (fallback)
+        if ok_math and best_valid is None:
+            best_valid = draft
+            best_valid_iter = it
+            best_valid_math = math_info
 
     st.divider()
-    st.markdown("## Final ASSUMPTION Draft")
-    st.write(final)
+    st.markdown("## Best Valid Iteration")
+    if best_valid is None:
+        st.error("No math-valid iteration produced. Increase iterations or tighten assumptions.")
+        st.stop()
 
+    st.write(f"Selected iteration: {best_valid_iter}")
+    st.write(best_valid)
+
+    # ----------------------------
+    # FINAL SYNTHESIS STEP (Option B)
+    # Take best_valid + produce clean final memo, must keep math claims schema & verify.
+    # ----------------------------
+    st.divider()
+    st.markdown("## Final Consolidated Response (Synthesis)")
+
+    SYNTH_SYSTEM = "\n".join([
+        "You are Nemexis Final Synthesizer.",
+        "You will be given a best-valid draft that already passed math verification.",
+        "Your job: produce a clean consolidated IC-ready memo.",
+        "Rules:",
+        "- Preserve Case A / Case B definitions.",
+        "- Do not introduce new numeric assumptions beyond those already in the draft.",
+        "- Keep exactly one Math Claims JSON block at the end (schema-compliant, fenced).",
+        "- Do NOT include any other JSON blocks or inline code snippets.",
+        "- All computed numbers must appear in Math Claims and match the prose.",
+        "- If you change any computed number in prose, update Math Claims expected accordingly.",
+    ])
+
+    SYNTH_FORMAT = "\n".join([
+        "Return in this exact structure:",
+        "",
+        "## Final IC Memo (Consolidated)",
+        "- 10 bullets max, decision-grade",
+        "",
+        "## Assumptions Register",
+        "- list assumptions (from the draft) in clean bullets",
+        "",
+        "## Case A vs Case B (1 table or tight bullets)",
+        "",
+        "## Top 3 Technical Drivers",
+        "",
+        "## Contractual Mitigants / Gaps",
+        "",
+        "## Recommendation",
+        "",
+        "## Math Claims (JSON)",
+        "(single fenced block, schema compliant)",
+    ])
+
+    synth_input = "\n\n".join([
+        "BEST VALID DRAFT:",
+        best_valid,
+        "OUTPUT FORMAT:",
+        SYNTH_FORMAT
+    ])
+
+    # try synthesis up to 2 times to satisfy math gate
+    final_memo = None
+    final_math_table = None
+    last_err = None
+
+    for attempt in range(1, 3):
+        with st.spinner(f"Synthesizing final memo (attempt {attempt})..."):
+            memo = leader_call(SYNTH_SYSTEM, synth_input, temperature=0.2)
+
+        ok_math, math_info = math_gate_ok(memo)
+        if ok_math:
+            final_memo = memo
+            final_math_table = math_info
+            break
+        last_err = math_info
+
+    if final_memo is None:
+        st.error(f"Final synthesis could not pass math verification. Last error: {last_err}")
+        st.write("Showing best-valid iteration instead:")
+        st.write(best_valid)
+    else:
+        st.write(final_memo)
+        st.markdown("### Final memo — Math Verification")
+        st.table(final_math_table)
+        st.success("Final consolidated memo is math-verified ✅")
+
+    # ----------------------------
+    # EXPORT
+    # ----------------------------
     export_text = f"""# Nemexis Export
 Generated: {datetime.datetime.now()}
 Leader: {leader}
-Mode: ASSUMPTION
+Mode: ASSUMPTION + Final Synthesis (v10.2)
 
 ## USER PROMPT
 {user_prompt.strip()}
@@ -615,7 +685,7 @@ Mode: ASSUMPTION
 ## CONTEXT
 {user_context.strip() if user_context.strip() else "(none)"}
 
-## USER PROVIDED BLOCKER INPUTS
+## USER PROVIDED INPUTS
 {blocker_input.strip() if blocker_input.strip() else "(none)"}
 
 ## ASSUMPTION PACK
@@ -623,8 +693,13 @@ Mode: ASSUMPTION
 
 ---
 
-## FINAL DRAFT
-{final}
+## BEST VALID ITERATION (#{best_valid_iter})
+{best_valid}
+
+---
+
+## FINAL CONSOLIDATED RESPONSE
+{final_memo if final_memo else best_valid}
 
 ---
 
@@ -634,7 +709,7 @@ Mode: ASSUMPTION
         export_text += f"\n\n### Iteration {h['iter']}\n"
         export_text += f"- Math OK: {h['math_ok']}\n"
         export_text += f"- Blocking: {h['blockers']}\n"
-        export_text += f"- Issues: {h['issues']}\n"
+        export_text += f"- Math fail reason: {h['math_fail_reason']}\n"
         export_text += "\n---\n"
         export_text += h["draft"]
 

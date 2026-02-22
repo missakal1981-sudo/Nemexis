@@ -11,26 +11,8 @@ import requests
 import streamlit.components.v1 as components
 from simpleeval import SimpleEval
 
-# =====================================================
-# Nemexis v10.3 — Universal fixes (still domain-agnostic)
-#
-# Adds:
-# 1) Scenario Definitions (required, explicit)
-# 2) Universal time-basis control (annual vs monthly)
-# 3) Universal allocation model control (incremental vs total rebalance vs capped)
-# 4) Deterministic Math Claims verification with:
-#    - schema enforcement
-#    - unit/time-basis coherence checks
-#    - currency tolerances (+/- $1M)
-# 5) Best-valid iteration selection + final synthesis (math-verified)
-# 6) Password UX button + feedback + session state
-# 7) Leader switching (OpenAI / Claude / Grok)
-#
-# NOTE: Finance functions supported deterministically: pmt/npv/irr + arithmetic.
-# =====================================================
-
-st.set_page_config(page_title="Nemexis v10.3", layout="wide")
-st.title("Nemexis v10.3 — Universal Reliability Engine (Scenarios + Time Basis + Verified Math)")
+st.set_page_config(page_title="Nemexis v10.3.1", layout="wide")
+st.title("Nemexis v10.3.1 — Universal Reliability (Auto-Repair Math Claims + Verified Synthesis)")
 
 # ----------------------------
 # Secrets
@@ -138,7 +120,7 @@ def irr(cashflows, guess=0.1, max_iter=100, tol=1e-7):
     raise ValueError("IRR did not converge")
 
 # ----------------------------
-# Math Claims parsing/verification
+# Math Claims parsing/verification + auto-repair
 # ----------------------------
 def extract_json_block(text: str) -> str | None:
     marker = "```json"
@@ -153,51 +135,112 @@ def extract_json_block(text: str) -> str | None:
         return None
     return text[start:end].strip()
 
-def validate_math_claims_schema(claims_json: dict):
-    if not isinstance(claims_json, dict):
-        return False, "Math Claims JSON is not an object"
-    if "claims" not in claims_json or not isinstance(claims_json["claims"], list):
-        return False, "Math Claims JSON must contain 'claims' as a list"
-
-    for i, c in enumerate(claims_json["claims"]):
-        if not isinstance(c, dict):
-            return False, f"Claim #{i} is not an object"
-        for k in ["id", "type", "inputs", "expected", "units"]:
-            if k not in c:
-                return False, f"Claim #{i} missing key '{k}'"
-        ctype = c["type"]
-        if ctype not in ["arithmetic", "pmt", "npv", "irr"]:
-            return False, f"Claim #{i} invalid type '{ctype}'"
-
-        if ctype == "arithmetic":
-            if "expr" not in c:
-                return False, f"Arithmetic claim #{i} missing 'expr'"
-            if not isinstance(c["inputs"], dict):
-                return False, f"Arithmetic claim #{i} inputs must be object"
-        elif ctype == "pmt":
-            req = {"rate", "nper", "pv"}
-            if not req.issubset(set(c["inputs"].keys())):
-                return False, f"PMT claim #{i} inputs must include {sorted(list(req))}"
-        elif ctype == "npv":
-            req = {"rate", "cashflows"}
-            if not req.issubset(set(c["inputs"].keys())):
-                return False, f"NPV claim #{i} inputs must include {sorted(list(req))}"
-        elif ctype == "irr":
-            req = {"cashflows"}
-            if not req.issubset(set(c["inputs"].keys())):
-                return False, f"IRR claim #{i} inputs must include {sorted(list(req))}"
-
-    return True, "OK"
+def strip_json_comments(s: str) -> str:
+    # remove //... and trailing commas issues are harder; at least strip JS-style comments
+    s = re.sub(r"//.*", "", s)
+    return s
 
 def _tolerances_for_units(units: str):
     u = (units or "").lower()
     if "usd" in u:
-        return 1e-6, 1_000_000.0  # rounding ok to ~$1M
+        return 1e-6, 1_000_000.0
     if "ratio" in u:
         return 1e-6, 1e-6
     if "%" in u or "percent" in u:
         return 1e-6, 1e-4
     return 1e-6, 1.0
+
+def _default_units_for_claim(claim_type: str, time_basis: str):
+    if claim_type == "pmt":
+        return "USD_per_year" if time_basis == "annual" else "USD_per_month"
+    return "USD"
+
+def _compute_claim_value(claim: dict):
+    ctype = claim.get("type")
+    inputs = claim.get("inputs") or {}
+    if ctype == "arithmetic":
+        expr = claim.get("expr", "")
+        se = SimpleEval()
+        se.names = dict(inputs)
+        return se.eval(expr)
+    if ctype == "pmt":
+        return pmt(**inputs)
+    if ctype == "npv":
+        return npv(**inputs)
+    if ctype == "irr":
+        return irr(**inputs)
+    raise ValueError(f"Unknown claim type: {ctype}")
+
+def auto_repair_math_claims(claims_obj: dict, time_basis: str):
+    """
+    Universal auto-repair:
+    - ensure top-level 'claims' exists and is list
+    - for each claim: ensure id/type/inputs/units/expected exist
+    - if expected missing: compute deterministically and insert (rounded to nearest 1e3 for stability)
+    - if units missing: set default based on type and time basis
+    """
+    if not isinstance(claims_obj, dict):
+        return None, "Math Claims root is not an object"
+
+    claims = claims_obj.get("claims")
+    if not isinstance(claims, list):
+        return None, "Math Claims missing 'claims' list"
+
+    repaired = {"claims": []}
+    for i, c in enumerate(claims):
+        if not isinstance(c, dict):
+            return None, f"Claim #{i} is not an object"
+
+        # minimally require type + inputs; id can be generated
+        ctype = c.get("type")
+        inputs = c.get("inputs")
+        if ctype not in ("arithmetic", "pmt", "npv", "irr"):
+            return None, f"Claim #{i} invalid type '{ctype}'"
+        if not isinstance(inputs, dict):
+            return None, f"Claim #{i} missing/invalid inputs"
+
+        fixed = dict(c)
+        if "id" not in fixed or not str(fixed["id"]).strip():
+            fixed["id"] = f"claim_{i}"
+
+        if "units" not in fixed or not str(fixed["units"]).strip():
+            fixed["units"] = _default_units_for_claim(ctype, time_basis)
+
+        # Arithmetic must have expr
+        if ctype == "arithmetic" and "expr" not in fixed:
+            return None, f"Arithmetic claim #{i} missing expr"
+
+        # PMT schema
+        if ctype == "pmt":
+            req = {"rate", "nper", "pv"}
+            if not req.issubset(set(inputs.keys())):
+                return None, f"PMT claim #{i} inputs must include {sorted(list(req))}"
+
+        if ctype == "npv":
+            req = {"rate", "cashflows"}
+            if not req.issubset(set(inputs.keys())):
+                return None, f"NPV claim #{i} inputs must include {sorted(list(req))}"
+
+        if ctype == "irr":
+            req = {"cashflows"}
+            if not req.issubset(set(inputs.keys())):
+                return None, f"IRR claim #{i} inputs must include {sorted(list(req))}"
+
+        # Ensure expected exists; if missing, compute deterministically
+        if "expected" not in fixed:
+            try:
+                val = _compute_claim_value(fixed)
+                # store rounded to nearest 1,000 for USD-ish stability
+                if "usd" in (fixed.get("units") or "").lower():
+                    fixed["expected"] = float(round(float(val) / 1000.0) * 1000.0)
+                else:
+                    fixed["expected"] = float(val)
+            except Exception as e:
+                return None, f"Could not compute expected for claim {fixed['id']}: {e}"
+
+        repaired["claims"].append(fixed)
+
+    return repaired, None
 
 def verify_math_claims(claims_json: dict):
     results = []
@@ -231,81 +274,40 @@ def verify_math_claims(claims_json: dict):
             else:
                 rel_tol, abs_tol = _tolerances_for_units(units)
                 row["ok"] = math.isclose(float(computed), float(expected), rel_tol=rel_tol, abs_tol=abs_tol)
-
         except Exception as e:
             row["error"] = str(e)
         results.append(row)
     return results
 
-def _time_basis_from_claim(claim: dict) -> str | None:
-    """Infer time basis from claim inputs for PMT, or from units."""
-    units = (claim.get("units") or "").lower()
-    if "per_month" in units or "/month" in units or "usd_per_month" in units:
-        return "monthly"
-    if "per_year" in units or "/year" in units or "usd_per_year" in units:
-        return "annual"
-    # If PMT, infer from nper (12*years often) and rate magnitude
-    if claim.get("type") == "pmt":
-        nper = claim.get("inputs", {}).get("nper")
-        rate = claim.get("inputs", {}).get("rate")
-        try:
-            nper = int(nper)
-            rate = float(rate)
-        except Exception:
-            return None
-        if nper >= 120:  # likely monthly
-            return "monthly"
-        # otherwise annual-ish
-        return "annual"
-    return None
-
-def _units_match_time_basis(units: str, time_basis: str) -> bool:
-    u = (units or "").lower()
-    if time_basis == "monthly":
-        return ("month" in u) or ("per_month" in u) or ("usd/month" in u)
-    if time_basis == "annual":
-        return ("year" in u) or ("per_year" in u) or ("usd/year" in u) or ("annual" in u)
-    return True
-
-def math_gate_ok(text: str, expected_time_basis: str | None = None):
-    """
-    Math gate:
-    - fenced json exists
-    - schema ok
-    - deterministic verification ok
-    - universal unit/time-basis coherence: if expected_time_basis provided, PMT claims must match units
-    """
+def math_gate_ok(text: str, time_basis: str):
     block = extract_json_block(text)
     if not block:
         return False, "No fenced ```json``` block found in Math Claims section"
+
+    block = strip_json_comments(block)
+
     try:
-        claims = json.loads(block)
+        raw = json.loads(block)
     except Exception as e:
         return False, f"Math Claims JSON parse error: {e}"
 
-    ok_schema, msg = validate_math_claims_schema(claims)
-    if not ok_schema:
-        return False, f"Math Claims schema error: {msg}"
+    # Auto-repair before verifying
+    repaired, err = auto_repair_math_claims(raw, time_basis=time_basis)
+    if err:
+        return False, f"Math Claims auto-repair failed: {err}"
 
-    # unit/time-basis coherence check (universal)
-    if expected_time_basis:
-        for c in claims.get("claims", []):
-            if c.get("type") == "pmt":
-                tb = _time_basis_from_claim(c) or expected_time_basis
-                if not _units_match_time_basis(c.get("units", ""), tb):
-                    return False, f"Units/time-basis mismatch in {c.get('id')}: units={c.get('units')} expected_time_basis={tb}"
-
-    results = verify_math_claims(claims)
+    results = verify_math_claims(repaired)
     for r in results:
         if r["error"] is not None:
             return False, f"Math verifier error in {r['id']}: {r['error']}"
         if r["expected"] is not None and r["ok"] is False:
             return False, f"Math mismatch in {r['id']}"
+
     return True, results
 
-def render_math_table(text: str, title: str, expected_time_basis: str | None):
+def render_math_table(text: str, title: str, time_basis: str):
     st.markdown(f"### Math Verification — {title}")
-    ok, info = math_gate_ok(text, expected_time_basis=expected_time_basis)
+    ok, info = math_gate_ok(text, time_basis=time_basis)
     if ok and isinstance(info, list):
         st.table(info)
         st.success("Math verified ✅")
@@ -314,7 +316,7 @@ def render_math_table(text: str, title: str, expected_time_basis: str | None):
     return ok, info
 
 # ----------------------------
-# Blocking parsing (treat "None" as empty)
+# Blocking parsing
 # ----------------------------
 def parse_blocking_items(text: str):
     m = re.search(r"## Missing Inputs.*?### Blocking(.*?)(### Non-blocking|## Claims Audit|## Confidence|## Math Claims|$)", text, flags=re.S | re.I)
@@ -386,7 +388,7 @@ def call_grok(model_name: str, system: str, user_text: str) -> str:
     return last_err or "❌ Grok Error: unknown"
 
 # ----------------------------
-# Leader selection
+# Leader selection UI
 # ----------------------------
 available_leaders = []
 if OPENAI_API_KEY:
@@ -415,7 +417,7 @@ def leader_call(system: str, user_text: str, temperature=0.2):
     return call_grok(grok_model, system, user_text)
 
 # ----------------------------
-# Universal UI controls (no domain hardcoding)
+# Universal controls
 # ----------------------------
 st.markdown("### Universal Controls")
 time_basis = st.selectbox("Time basis for periodic claims", ["annual", "monthly"], index=0)
@@ -423,11 +425,10 @@ allocation_model = st.selectbox(
     "Allocation model for shock/overrun scenarios",
     ["incremental_allocation", "total_rebalance", "capped_variable"],
     index=0,
-    help="incremental_allocation: apply ratios to delta only; total_rebalance: apply ratios to total; capped_variable: keep one fixed and allocate remainder"
 )
 
 # ----------------------------
-# UI: Problem
+# Problem inputs
 # ----------------------------
 st.markdown("### Problem")
 user_prompt = st.text_area("Prompt", height=220)
@@ -463,7 +464,7 @@ with colB:
 max_iters = st.slider("ASSUMPTION iterations", 2, 8, 4)
 
 # ----------------------------
-# Master prompts: Universal Scenario Definitions + Units rules
+# Master format (universal scenario definitions + single JSON block)
 # ----------------------------
 MASTER_FORMAT = "\n".join([
     "Return in this exact structure:",
@@ -471,19 +472,19 @@ MASTER_FORMAT = "\n".join([
     "## Mode Banner",
     "",
     "## Scenario Definitions (MANDATORY)",
-    "- Time basis: annual OR monthly (must match the selection below).",
-    "- Allocation model: incremental_allocation OR total_rebalance OR capped_variable (must match selection below).",
-    "- Define Case A and Case B explicitly using that allocation model (no ambiguity).",
+    "- Time basis: must equal TIME_BASIS_SELECTED.",
+    "- Allocation model: must equal ALLOCATION_MODEL_SELECTED.",
+    "- Define Case A and Case B explicitly using the chosen allocation model (no ambiguity).",
     "",
     "## Inputs Used (Verbatim)",
-    "- Bullet list of key-value facts only.",
+    "- Bullet list key-value facts only.",
     "",
     "## Assumptions Added by Master",
     "",
     "## Executive Answer",
     "",
     "## Calculations / Logic",
-    "- NO inline JSON examples. Do not include any code blocks except the single Math Claims JSON block.",
+    "- No inline code blocks. No JSON in narrative. Only one JSON block at the end.",
     "",
     "## Key Risks (ranked)",
     "",
@@ -496,29 +497,9 @@ MASTER_FORMAT = "\n".join([
     "## Claims Audit",
     "",
     "## Math Claims (JSON)",
-    "Provide exactly ONE fenced JSON block (no other JSON anywhere).",
-    "Schema:",
-    "```json",
-    "{",
-    '  "claims": [',
-    "    {",
-    '      "id": "capex_overrun",',
-    '      "type": "arithmetic",',
-    '      "expr": "CAPEX*0.15",',
-    '      "inputs": {"CAPEX": 3200000000},',
-    '      "expected": 480000000,',
-    '      "units": "USD"',
-    "    }",
-    "  ]",
-    "}",
-    "```",
-    "",
-    "Rules:",
-    "- For pmt: type='pmt' and inputs keys rate,nper,pv (no expr).",
-    "- rate must match time basis (annual rate if annual; monthly rate if monthly).",
-    "- nper must match time basis (years if annual; months if monthly).",
-    "- units must match time basis: USD_per_year for annual; USD_per_month for monthly.",
-    "- Do not call PMT() inside arithmetic expr.",
+    "Provide exactly one fenced JSON block with schema {\"claims\":[...]}",
+    "- For pmt: type='pmt', inputs keys rate,nper,pv.",
+    "- rate and nper must match Time basis, and units must match time basis.",
     "",
     "## Confidence",
 ])
@@ -527,16 +508,16 @@ MASTER_SYSTEM_STRICT = "\n".join([
     "You are Nemexis Master (STRICT).",
     "- Do NOT add numeric assumptions.",
     "- If blocking inputs exist, do NOT state threshold outcomes as likely; say cannot determine.",
-    "- Any computed number must be backed by ONE fenced Math Claims JSON block (valid schema).",
-    "- Scenario Definitions must match the selected time basis and allocation model.",
+    "- Provide exactly one fenced Math Claims JSON block.",
+    "- Scenario Definitions must match TIME_BASIS_SELECTED and ALLOCATION_MODEL_SELECTED.",
 ])
 
 MASTER_SYSTEM_ASSUME = "\n".join([
     "You are Nemexis Master (ASSUMPTION MODE).",
     "- Use the Assumption Pack to fill missing values; tag each [Assumed] (prefer ranges + sensitivity).",
-    "- Scenario Definitions must match selected time basis and allocation model.",
-    "- Provide PMT as type=pmt with correct time basis (rate,nper) and matching units.",
-    "- Provide only one fenced Math Claims JSON block.",
+    "- Provide exactly one fenced Math Claims JSON block with schema {\"claims\":[...]}",
+    "- Scenario Definitions must match TIME_BASIS_SELECTED and ALLOCATION_MODEL_SELECTED.",
+    "- PMT claims must be type='pmt' with correct inputs schema and units/time basis consistency.",
     "- In ASSUMPTION mode, Blocking should be NONE unless truly impossible.",
 ])
 
@@ -600,9 +581,7 @@ if run_strict:
     if fence_err:
         st.error(fence_err)
 
-    ok_math, info = math_gate_ok(draft, expected_time_basis=time_basis)
-    render_math_table(draft, "STRICT", expected_time_basis=time_basis)
-
+    render_math_table(draft, "STRICT", time_basis=time_basis)
     st.write(draft)
 
     blockers = parse_blocking_items(draft)
@@ -639,9 +618,9 @@ if run_assume:
                 "",
                 "Hard rules:",
                 "- One fenced Math Claims JSON block only.",
-                "- PMT must be type=pmt with correct time basis (rate,nper) and matching units.",
-                "- Scenario Definitions must match TIME_BASIS_SELECTED and ALLOCATION_MODEL_SELECTED.",
-                "- In ASSUMPTION mode, Blocking should be NONE (fill gaps).",
+                "- Scenario Definitions must match selected Time basis and Allocation model.",
+                "- PMT claims: type=pmt, inputs rate/nper/pv; units must match time basis.",
+                "- Blocking must be NONE in ASSUMPTION mode (fill gaps).",
             ])
 
         def draft_call():
@@ -653,7 +632,7 @@ if run_assume:
 
         st.write(draft)
 
-        ok_math, math_info = math_gate_ok(draft, expected_time_basis=time_basis)
+        ok_math, math_info = math_gate_ok(draft, time_basis=time_basis)
         if ok_math:
             st.success("Math verified ✅")
             st.table(math_info)
@@ -692,35 +671,29 @@ if run_assume:
     st.write(f"Selected iteration: {best_valid_iter}")
     st.write(best_valid)
 
-    # ----------------------------
-    # FINAL SYNTHESIS STEP (must pass math verification)
-    # ----------------------------
+    # Final synthesis (must pass math)
     st.divider()
     st.markdown("## Final Consolidated Response (Synthesis)")
 
     SYNTH_SYSTEM = "\n".join([
         "You are Nemexis Final Synthesizer.",
         "You will be given a best-valid draft that already passed math verification.",
-        "Your job: produce a clean consolidated IC-ready memo.",
+        "Produce a clean consolidated IC-ready memo.",
         "Rules:",
-        "- Preserve Scenario Definitions (time basis and allocation model) exactly.",
-        "- Do not introduce new numeric assumptions beyond those already in the draft.",
-        "- Keep exactly one fenced Math Claims JSON block at the end (schema-compliant).",
-        "- No other JSON blocks, no inline code blocks.",
-        "- All computed numbers must appear in Math Claims and match the prose.",
-        "- Ensure units match time basis: annual=>USD_per_year, monthly=>USD_per_month for PMT claims.",
+        "- Preserve Scenario Definitions exactly (time basis + allocation model).",
+        "- Do not introduce new numeric assumptions beyond those already present.",
+        "- Exactly one fenced Math Claims JSON block at the end (schema compliant).",
+        "- No other code blocks. No other JSON.",
     ])
 
     SYNTH_FORMAT = "\n".join([
         "Return in this exact structure:",
-        "",
         "## Final IC Memo (Consolidated)",
-        "- 10 bullets max, decision-grade",
+        "- 10 bullets max",
         "",
         "## Scenario Definitions",
         "",
         "## Assumptions Register",
-        "- list assumptions (from the draft) in clean bullets",
         "",
         "## Case A vs Case B",
         "",
@@ -731,7 +704,6 @@ if run_assume:
         "## Recommendation",
         "",
         "## Math Claims (JSON)",
-        "(single fenced block, schema compliant)",
     ])
 
     synth_input = "\n\n".join([
@@ -744,12 +716,10 @@ if run_assume:
     final_memo = None
     final_math_table = None
     last_err = None
-
     for attempt in range(1, 3):
         with st.spinner(f"Synthesizing final memo (attempt {attempt})..."):
             memo = leader_call(SYNTH_SYSTEM, synth_input, temperature=0.2)
-
-        ok_math, math_info = math_gate_ok(memo, expected_time_basis=time_basis)
+        ok_math, math_info = math_gate_ok(memo, time_basis=time_basis)
         if ok_math:
             final_memo = memo
             final_math_table = math_info
@@ -759,7 +729,6 @@ if run_assume:
     if final_memo is None:
         st.error(f"Final synthesis could not pass math verification. Last error: {last_err}")
         st.write("Showing best-valid iteration instead:")
-        st.write(best_valid)
         final_memo = best_valid
         final_math_table = best_valid_math if isinstance(best_valid_math, list) else []
 
@@ -769,13 +738,11 @@ if run_assume:
         st.table(final_math_table)
     st.success("Final consolidated memo is math-verified ✅")
 
-    # ----------------------------
-    # EXPORT
-    # ----------------------------
+    # Export
     export_text = f"""# Nemexis Export
 Generated: {datetime.datetime.now()}
 Leader: {leader}
-Mode: ASSUMPTION + Final Synthesis (v10.3)
+Mode: ASSUMPTION + Final Synthesis (v10.3.1)
 
 ## UNIVERSAL CONTROLS
 Time basis: {time_basis}

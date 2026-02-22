@@ -11,23 +11,11 @@ import requests
 import streamlit.components.v1 as components
 from simpleeval import SimpleEval
 
-# =====================================================
-# Nemexis v9 — STRICT + ASSUMPTION + Leader Switching + Deterministic Math
-#
-# Key features:
-# - Password unlock button w/ feedback + session persistence
-# - Two buttons: Run STRICT / Run ASSUMPTION
-# - Leader provider selectable: OpenAI / Claude / Grok (if keys exist)
-# - Critics are the remaining providers
-# - Assumption Pack (Finance + Technical) editable in UI for assumption mode
-# - Deterministic math verifier for Math Claims JSON (schema enforced)
-# =====================================================
-
-st.set_page_config(page_title="Nemexis v9", layout="wide")
-st.title("Nemexis v9 — Reliability Engine (STRICT + ASSUMPTION + Multi-Leader)")
+st.set_page_config(page_title="Nemexis v10", layout="wide")
+st.title("Nemexis v10 — STRICT/ASSUMPTION + Multi-Leader + Deterministic Math (Fixed)")
 
 # ----------------------------
-# Load Secrets / Keys
+# Load secrets
 # ----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
@@ -35,7 +23,7 @@ XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
 APP_PASSWORD = os.getenv("NEMEXIS_PASSWORD", "").strip()
 
 if not OPENAI_API_KEY and not ANTHROPIC_API_KEY and not XAI_API_KEY:
-    st.error("No model keys found. Add at least one key in Streamlit Secrets (OPENAI_API_KEY, ANTHROPIC_API_KEY, XAI_API_KEY).")
+    st.error("No model keys found. Add at least one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, XAI_API_KEY.")
     st.stop()
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -134,10 +122,8 @@ def irr(cashflows, guess=0.1, max_iter=100, tol=1e-7):
     raise ValueError("IRR did not converge")
 
 # ----------------------------
-# Math claims extraction + strict schema verification
+# Math Claims schema enforcement
 # ----------------------------
-REQUIRED_CLAIM_KEYS = {"id", "type", "units", "expected"}
-
 def extract_json_block(text: str) -> str | None:
     marker = "```json"
     start = text.find(marker)
@@ -152,48 +138,38 @@ def extract_json_block(text: str) -> str | None:
     return text[start:end].strip()
 
 def validate_math_claims_schema(claims_json: dict):
-    """
-    Expected format:
-    {
-      "claims": [
-        {"id":..., "type":"arithmetic|pmt|npv|irr", "expr":..., "inputs":..., "expected":..., "units":...},
-        ...
-      ]
-    }
-    For arithmetic: requires expr + inputs
-    For pmt/npv/irr: requires inputs dict with correct args
-    """
     if not isinstance(claims_json, dict):
         return False, "Math Claims JSON is not an object"
-
-    if "claims" not in claims_json:
-        return False, "Math Claims JSON must contain top-level key 'claims'"
-
-    if not isinstance(claims_json["claims"], list):
-        return False, "'claims' must be a list"
+    if "claims" not in claims_json or not isinstance(claims_json["claims"], list):
+        return False, "Math Claims JSON must contain 'claims' as a list"
 
     for i, c in enumerate(claims_json["claims"]):
         if not isinstance(c, dict):
             return False, f"Claim #{i} is not an object"
-        missing = REQUIRED_CLAIM_KEYS - set(c.keys())
-        if missing:
-            return False, f"Claim #{i} missing keys: {sorted(list(missing))}"
-
-        ctype = c.get("type", "")
-        if ctype not in ("arithmetic", "pmt", "npv", "irr"):
-            return False, f"Claim #{i} has invalid type: {ctype}"
+        for k in ["id", "type", "inputs", "expected", "units"]:
+            if k not in c:
+                return False, f"Claim #{i} missing key '{k}'"
+        ctype = c["type"]
+        if ctype not in ["arithmetic", "pmt", "npv", "irr"]:
+            return False, f"Claim #{i} invalid type '{ctype}'"
 
         if ctype == "arithmetic":
-            if "expr" not in c or "inputs" not in c:
-                return False, f"Arithmetic claim #{i} must include 'expr' and 'inputs'"
+            if "expr" not in c:
+                return False, f"Arithmetic claim #{i} missing 'expr'"
             if not isinstance(c["inputs"], dict):
-                return False, f"Arithmetic claim #{i} 'inputs' must be an object"
-        else:
-            if "inputs" not in c:
-                return False, f"{ctype} claim #{i} must include 'inputs'"
-            if not isinstance(c["inputs"], dict):
-                return False, f"{ctype} claim #{i} 'inputs' must be an object"
-
+                return False, f"Arithmetic claim #{i} inputs must be object"
+        elif ctype == "pmt":
+            required = {"rate", "nper", "pv"}
+            if not required.issubset(set(c["inputs"].keys())):
+                return False, f"PMT claim #{i} inputs must include {sorted(list(required))}"
+        elif ctype == "npv":
+            required = {"rate", "cashflows"}
+            if not required.issubset(set(c["inputs"].keys())):
+                return False, f"NPV claim #{i} inputs must include {sorted(list(required))}"
+        elif ctype == "irr":
+            required = {"cashflows"}
+            if not required.issubset(set(c["inputs"].keys())):
+                return False, f"IRR claim #{i} inputs must include {sorted(list(required))}"
     return True, "OK"
 
 def verify_math_claims(claims_json: dict, rel_tol=1e-6, abs_tol=1.0):
@@ -239,7 +215,7 @@ def verify_math_claims(claims_json: dict, rel_tol=1e-6, abs_tol=1.0):
 def math_gate_ok(text: str):
     block = extract_json_block(text)
     if not block:
-        return False, "No ```json``` block found for Math Claims"
+        return False, "No ```json``` block found in Math Claims section"
     try:
         claims = json.loads(block)
     except Exception as e:
@@ -285,34 +261,7 @@ def parse_blocking_items(text: str):
     return items if items else ["(No bullet items found under Blocking)"]
 
 # ----------------------------
-# Reviewer rubric JSON prompt
-# ----------------------------
-RUBRIC_PROMPT = "\n".join([
-    "You are a reviewer. Output ONLY a JSON object in this schema:",
-    "{",
-    '  "overall_score_0_5": 0,',
-    '  "critical_must_fix": [],',
-    '  "notes": ""',
-    "}",
-    "Rules:",
-    "- overall_score_0_5 is 0..5",
-    "- critical_must_fix is a list (empty if none)",
-    "- notes 1–3 sentences",
-    "- Do not include any other text"
-])
-
-def parse_reviewer_json(text: str):
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None, "No JSON object found"
-    try:
-        return json.loads(text[start:end+1]), None
-    except Exception as e:
-        return None, str(e)
-
-# ----------------------------
-# Model calls by provider
+# Model calls
 # ----------------------------
 def call_openai(model_name: str, system: str, user_text: str, temperature=0.2) -> str:
     if not openai_client:
@@ -365,7 +314,7 @@ def call_grok(model_name: str, system: str, user_text: str) -> str:
     return last_err or "❌ Grok Error: unknown"
 
 # ----------------------------
-# Leader / Critics selection UI
+# Leader selection
 # ----------------------------
 available_leaders = []
 if OPENAI_API_KEY:
@@ -375,16 +324,15 @@ if ANTHROPIC_API_KEY:
 if XAI_API_KEY:
     available_leaders.append("Grok")
 
-st.markdown("### Leader / Critic configuration")
+st.markdown("### Leader / Critics")
 leader = st.selectbox("Leader (drives the draft)", available_leaders, index=0)
 
-# Leader model selections by provider
-col_m1, col_m2, col_m3 = st.columns(3)
-with col_m1:
+col1, col2, col3 = st.columns(3)
+with col1:
     openai_model = st.selectbox("OpenAI model", ["gpt-4o-mini", "gpt-4o"], index=0, disabled=(not OPENAI_API_KEY))
-with col_m2:
+with col2:
     claude_model = st.selectbox("Claude model", ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"], index=0, disabled=(not ANTHROPIC_API_KEY))
-with col_m3:
+with col3:
     grok_model = st.selectbox("Grok model", ["grok-4-fast", "grok-4"], index=0, disabled=(not XAI_API_KEY))
 
 def leader_call(system: str, user_text: str, temperature=0.2):
@@ -394,54 +342,57 @@ def leader_call(system: str, user_text: str, temperature=0.2):
         return call_claude(claude_model, system, user_text)
     return call_grok(grok_model, system, user_text)
 
-def critic_calls(system: str, user_text: str):
-    # critics are the remaining configured providers (max 2)
-    outputs = {}
-    if leader != "OpenAI" and OPENAI_API_KEY:
-        outputs["OpenAI"] = call_openai(openai_model, system, user_text, temperature=0.2)
-    if leader != "Claude" and ANTHROPIC_API_KEY:
-        outputs["Claude"] = call_claude(claude_model, system, user_text)
-    if leader != "Grok" and XAI_API_KEY:
-        outputs["Grok"] = call_grok(grok_model, system, user_text)
-    return outputs
-
 # ----------------------------
-# Assumption Pack (Finance + Technical)
+# Assumption pack
 # ----------------------------
 DEFAULT_ASSUMPTION_PACK = "\n".join([
-    "ASSUMPTION PACK (Finance + Technical) — editable",
+    "Finance assumptions (use ranges; tag each [Assumed]):",
+    "- CAPEX phasing: Year1 30%, Year2 40%, Year3 30%",
+    "- IDC: capitalized at debt rate",
+    "- Debt amortization: if sculpting schedule missing, use level PMT",
+    "- O&M: 1–4% of CAPEX per year (use sensitivity)",
+    "- Taxes: 0–30% effective (use sensitivity)",
+    "- CFADS bridge: CFADS = EBITDA - O&M - taxes - reserves (define reserves if used)",
     "",
-    "Finance defaults (tag all as [Assumed]):",
-    "- CAPEX phasing over construction (example): Year1 30%, Year2 40%, Year3 30%",
-    "- Interest during construction (IDC): assume capitalized, rate = debt interest rate unless specified",
-    "- Debt amortization: if sculpting schedule not provided, assume level payment (PMT) over tenor",
-    "- CFADS bridge: CFADS = EBITDA - O&M - taxes - reserves (if missing, assume ranges and clearly label)",
-    "- O&M: if missing, assume a range (e.g., 1–4% of CAPEX per year) and show sensitivity",
-    "- Taxes: if missing, assume a range (e.g., 0–30% effective) and show sensitivity",
-    "",
-    "Technical defaults (tag all as [Assumed]):",
-    "- Availability: assume 92–98% (range)",
-    "- Capacity factor / performance: if needed, assume a range appropriate to the technology and disclose uncertainty",
-    "- Schedule risk: assume potential delay range (e.g., 0–12 months) and show effect on cost/time only (no hidden cashflows)",
-    "- Key technical failure modes: choose top 3 that plausibly drive cost/schedule for the stated asset type; if asset type is unclear, ask for it",
+    "Technical assumptions (use ranges; tag each [Assumed]):",
+    "- Availability: 92–98%",
+    "- Capacity factor: 40–55% (if required for revenue cross-check)",
+    "- Delay range: 0–12 months (if modeling schedule impacts)",
+    "- Top failure modes for offshore wind: (i) geotech/foundations, (ii) marine logistics/weather/vessels, (iii) cables/interconnection",
 ])
 
+st.markdown("### Problem")
+user_prompt = st.text_area("Prompt", height=220)
+user_context = st.text_area("Context (optional)", height=140)
+blocker_input = st.text_area("Provide missing inputs (optional)", height=120)
+
+st.markdown("### Assumption Pack (used only in ASSUMPTION)")
+assumption_pack = st.text_area("Assumption Pack", value=DEFAULT_ASSUMPTION_PACK, height=220)
+
+colA, colB = st.columns(2)
+with colA:
+    run_strict = st.button("Run STRICT")
+with colB:
+    run_assume = st.button("Run ASSUMPTION")
+
+max_iters = st.slider("ASSUMPTION iterations", 1, 6, 3)
+
 # ----------------------------
-# Master prompt templates
+# Master prompts
 # ----------------------------
 MASTER_FORMAT = "\n".join([
     "Return in this exact structure:",
     "",
     "## Mode Banner",
-    "- STRICT or ASSUMPTION",
     "",
     "## Inputs Used (Verbatim)",
+    "- List bullet key-value items ONLY (do not paste the whole prompt).",
     "",
     "## Assumptions Added by Master",
     "",
     "## Financing Treatment of Shock/Overrun (MANDATORY)",
-    "- Case A (Debt capped): scenario",
-    "- Case B (Debt upsized): scenario",
+    "- Case A (Debt capped): debt stays at base; overrun equity-funded (equity increases by full overrun).",
+    "- Case B (Pro-rata 60/40): incremental overrun funded 60/40 (debt +60%*overrun, equity +40%*overrun).",
     "",
     "## Executive Answer",
     "",
@@ -458,8 +409,7 @@ MASTER_FORMAT = "\n".join([
     "## Claims Audit",
     "",
     "## Math Claims (JSON)",
-    "Provide a single JSON block in this schema:",
-    "",
+    "Provide exactly one JSON block with this schema:",
     "```json",
     "{",
     '  "claims": [',
@@ -475,10 +425,21 @@ MASTER_FORMAT = "\n".join([
     "}",
     "```",
     "",
-    "Rules:",
-    "- Use type=arithmetic with expr+inputs+expected+units",
-    "- Use type=pmt/npv/irr only when inputs are complete",
-    "- expected MUST match what you state in the prose",
+    "PMT claim must use inputs keys: rate (decimal), nper, pv.",
+    "Example:",
+    "```json",
+    "{",
+    '  "claims": [',
+    "    {",
+    '      "id": "debt_service",',
+    '      "type": "pmt",',
+    '      "inputs": {"rate": 0.065, "nper": 20, "pv": 1920000000},',
+    '      "expected": -175000000,',
+    '      "units": "USD_per_year"',
+    "    }",
+    "  ]",
+    "}",
+    "```",
     "",
     "## Confidence",
 ])
@@ -486,111 +447,49 @@ MASTER_FORMAT = "\n".join([
 MASTER_SYSTEM_STRICT = "\n".join([
     "You are Nemexis Master (STRICT).",
     "Rules:",
-    "- Do NOT invent numeric inputs.",
-    "- If blocking inputs remain, do NOT claim threshold outcomes as likely. Say cannot determine.",
-    "- Any [Computed] number must be backed by a Math Claim and must verify.",
-    "- If you cannot provide Math Claims in the required schema, do not label any number [Computed].",
+    "- Do NOT add numeric assumptions.",
+    "- If blocking inputs exist, do NOT state threshold outcomes as likely; say cannot determine.",
+    "- Any computed number must be backed by Math Claims JSON (schema must be valid).",
 ])
 
 MASTER_SYSTEM_ASSUME = "\n".join([
     "You are Nemexis Master (ASSUMPTION MODE).",
     "Rules:",
-    "- You MAY fill gaps using the Assumption Pack, but every assumed number must be tagged [Assumed] and listed.",
-    "- Prefer ranges + show sensitivity rather than single point values.",
-    "- Any [Computed] number must be backed by a Math Claim and must verify.",
-    "- Your Math Claims JSON MUST follow the required schema exactly.",
-    "- In ASSUMPTION mode, Blocking inputs should be driven to NONE by assumptions (unless truly impossible).",
+    "- Use the Assumption Pack to fill missing values; tag each [Assumed]. Prefer ranges + sensitivity.",
+    "- Case A definition: debt stays at base; overrun equity-funded (equity = base equity + overrun).",
+    "- Case B definition: incremental overrun funded 60/40 (debt += 0.6*overrun; equity += 0.4*overrun).",
+    "- Any computed number must be backed by Math Claims JSON with VALID schema.",
 ])
 
-# ----------------------------
-# User prompt sanitation warning (optional)
-# ----------------------------
-def looks_polluted(text: str) -> bool:
-    # If many unrelated short lines without bullets, warn
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if len(lines) > 40:
-        return True
-    junk_markers = ["Personal account", "Miguel Sanchez", "Hustle Business", "litigation", "News research request"]
-    return any(m.lower() in text.lower() for m in junk_markers)
-
-# ----------------------------
-# UI Inputs
-# ----------------------------
-st.markdown("### Problem")
-user_prompt = st.text_area("Prompt", height=220, placeholder="Paste the question / task here (clean).")
-user_context = st.text_area("Context (optional)", height=140, placeholder="Paste data, excerpts, constraints…")
-
-st.markdown("### Two-mode workflow")
-col_a, col_b = st.columns(2)
-with col_a:
-    run_strict = st.button("Run STRICT")
-with col_b:
-    run_assume = st.button("Run ASSUMPTION")
-
-st.markdown("### Assumption Pack (used only in ASSUMPTION mode)")
-assumption_pack = st.text_area("Assumption Pack", value=DEFAULT_ASSUMPTION_PACK, height=260)
-
-max_iters = st.slider("ASSUMPTION iterations", 1, 6, 3)
-
-# ----------------------------
-# Review rubrics
-# ----------------------------
-def reviewer_rubrics(draft: str):
-    critics = critic_calls("You are a strict reviewer.", draft + "\n\n" + RUBRIC_PROMPT)
-    parsed = {}
-    for k, raw in critics.items():
-        obj, err = parse_reviewer_json(raw)
-        if obj is None:
-            obj = {"overall_score_0_5": 0, "critical_must_fix": ["Could not parse JSON"], "notes": err or ""}
-        parsed[k] = obj
-    return parsed
-
-# ----------------------------
-# Run functions
-# ----------------------------
 def build_user_text():
     txt = user_prompt.strip()
     if user_context.strip():
         txt += "\n\n---\nContext:\n" + user_context.strip()
+    if blocker_input.strip():
+        txt += "\n\n---\nUser-provided missing inputs:\n" + blocker_input.strip()
     return txt
 
-def strict_run():
+def run_master_strict():
     txt = build_user_text()
-    if looks_polluted(txt):
-        st.warning("Your prompt looks polluted with unrelated text. Clean it for best results.")
+    master_input = "\n\n".join(["MODE: STRICT", "USER PROMPT:", txt, "OUTPUT FORMAT:", MASTER_FORMAT])
+    return leader_call(MASTER_SYSTEM_STRICT, master_input, temperature=0.15)
 
-    master_input = "\n\n".join([
-        "MODE: STRICT",
-        "USER PROMPT:",
-        txt,
-        "OUTPUT FORMAT:",
-        MASTER_FORMAT
-    ])
-
-    draft = leader_call(MASTER_SYSTEM_STRICT, master_input, temperature=0.15)
-    return draft
-
-def assume_run(prev_feedback: str):
+def run_master_assume(feedback: str):
     txt = build_user_text()
-    if looks_polluted(txt):
-        st.warning("Your prompt looks polluted with unrelated text. Clean it for best results.")
-
     master_input = "\n\n".join([
         "MODE: ASSUMPTION",
         "USER PROMPT:",
         txt,
         "ASSUMPTION PACK:",
         assumption_pack.strip(),
-        prev_feedback.strip() if prev_feedback else "",
+        feedback.strip() if feedback else "",
         "OUTPUT FORMAT:",
         MASTER_FORMAT
     ])
-
-    draft = leader_call(MASTER_SYSTEM_ASSUME, master_input, temperature=0.25)
-    return draft
+    return leader_call(MASTER_SYSTEM_ASSUME, master_input, temperature=0.25)
 
 # ----------------------------
-# Execute STRICT
+# STRICT run (auto retry once if math fails)
 # ----------------------------
 if run_strict:
     if not user_prompt.strip():
@@ -600,23 +499,20 @@ if run_strict:
     st.divider()
     st.markdown("## STRICT Result")
 
-    draft = strict_run()
-    st.write(draft)
+    draft = run_master_strict()
+    ok_math, _ = render_math_table(draft, "STRICT (attempt 1)")
+    if not ok_math:
+        st.warning("STRICT failed math schema/verification. Auto-retrying once…")
+        draft = run_master_strict()
+        ok_math, _ = render_math_table(draft, "STRICT (attempt 2)")
 
-    ok_math, math_info = render_math_table(draft, "STRICT")
+    st.write(draft)
     blockers = parse_blocking_items(draft)
     st.markdown("### Blocking inputs")
     st.write(blockers if blockers else ["None"])
 
-    rubrics = reviewer_rubrics(draft)
-    st.markdown("### Critic rubrics")
-    st.json(rubrics)
-
-    if blockers:
-        st.info("STRICT found blockers. Either provide missing inputs (in Context) and re-run STRICT, or run ASSUMPTION mode.")
-
 # ----------------------------
-# Execute ASSUMPTION (iterative)
+# ASSUMPTION iterative (schema enforced)
 # ----------------------------
 if run_assume:
     if not user_prompt.strip():
@@ -639,42 +535,37 @@ if run_assume:
                 "PREVIOUS ITERATION MUST-FIX:",
                 f"- Math OK: {prev['math_ok']}",
                 f"- Blocking inputs: {prev['blockers']}",
-                f"- Critic must-fix items: {prev['must_fix']}",
+                f"- Issues: {prev['issues']}",
                 "",
                 "Rules:",
-                "- Fix Math Claims JSON schema if wrong.",
-                "- Ensure all computed numbers are backed by Math Claims.",
-                "- In ASSUMPTION mode, Blocking should be NONE (fill gaps with explicit assumptions).",
+                "- Math Claims JSON must be valid schema and match prose.",
+                "- Fix Case A / Case B definitions if wrong.",
+                "- In ASSUMPTION mode, Blocking should be NONE (fill gaps explicitly).",
             ])
 
-        draft = assume_run(feedback)
+        draft = run_master_assume(feedback)
         st.write(draft)
 
         ok_math, _ = render_math_table(draft, f"ASSUMPTION iter {it}")
         blockers = parse_blocking_items(draft)
 
-        rubrics = reviewer_rubrics(draft)
-        st.markdown("#### Critic rubrics")
-        st.json(rubrics)
-
-        must_fix = []
-        for r in rubrics.values():
-            must_fix.extend(r.get("critical_must_fix", []))
+        issues = []
+        if blockers:
+            issues.append("Blocking inputs remain")
+        if not ok_math:
+            issues.append("Math schema/verification failed")
 
         history.append({
             "iter": it,
             "draft": draft,
             "math_ok": ok_math,
             "blockers": blockers,
-            "rubrics": rubrics,
-            "must_fix": must_fix
+            "issues": issues
         })
 
         blockers_empty = (len(blockers) == 0)
-        no_critical = (len(must_fix) == 0)
-
-        if ok_math and blockers_empty and no_critical:
-            st.success("✅ Converged in ASSUMPTION mode.")
+        if ok_math and blockers_empty:
+            st.success("✅ Converged (math verified + no blocking inputs).")
             final = draft
             break
 
@@ -687,13 +578,16 @@ if run_assume:
     export_text = f"""# Nemexis Export
 Generated: {datetime.datetime.now()}
 Leader: {leader}
-Mode: ASSUMPTION (iterative)
+Mode: ASSUMPTION
 
 ## USER PROMPT
 {user_prompt.strip()}
 
 ## CONTEXT
 {user_context.strip() if user_context.strip() else "(none)"}
+
+## USER PROVIDED BLOCKER INPUTS
+{blocker_input.strip() if blocker_input.strip() else "(none)"}
 
 ## ASSUMPTION PACK
 {assumption_pack.strip()}
@@ -711,7 +605,7 @@ Mode: ASSUMPTION (iterative)
         export_text += f"\n\n### Iteration {h['iter']}\n"
         export_text += f"- Math OK: {h['math_ok']}\n"
         export_text += f"- Blocking: {h['blockers']}\n"
-        export_text += f"- Must-fix: {h['must_fix']}\n"
+        export_text += f"- Issues: {h['issues']}\n"
         export_text += "\n---\n"
         export_text += h["draft"]
 

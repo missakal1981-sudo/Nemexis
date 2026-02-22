@@ -11,8 +11,8 @@ import requests
 import streamlit.components.v1 as components
 from simpleeval import SimpleEval
 
-st.set_page_config(page_title="Nemexis v10", layout="wide")
-st.title("Nemexis v10 — STRICT/ASSUMPTION + Multi-Leader + Deterministic Math (Fixed)")
+st.set_page_config(page_title="Nemexis v10.1", layout="wide")
+st.title("Nemexis v10.1 — STRICT/ASSUMPTION + Multi-Leader + Deterministic Math (Tolerance + Fenced JSON)")
 
 # ----------------------------
 # Load secrets
@@ -172,7 +172,22 @@ def validate_math_claims_schema(claims_json: dict):
                 return False, f"IRR claim #{i} inputs must include {sorted(list(required))}"
     return True, "OK"
 
-def verify_math_claims(claims_json: dict, rel_tol=1e-6, abs_tol=1.0):
+def _tolerances_for_units(units: str):
+    """
+    Per-unit tolerance policy.
+    - USD / USD_per_year: allow +/- $1,000,000 (rounding OK)
+    - ratio / % / others: keep strict-ish
+    """
+    u = (units or "").lower()
+    if "usd" in u:
+        return 1e-6, 1_000_000.0  # rel_tol, abs_tol
+    if "ratio" in u:
+        return 1e-6, 1e-6
+    if "%" in u or "percent" in u:
+        return 1e-6, 1e-4
+    return 1e-6, 1.0
+
+def verify_math_claims(claims_json: dict):
     results = []
     for c in claims_json.get("claims", []):
         cid = c.get("id", "")
@@ -203,6 +218,7 @@ def verify_math_claims(claims_json: dict, rel_tol=1e-6, abs_tol=1.0):
             if expected is None:
                 row["ok"] = True
             else:
+                rel_tol, abs_tol = _tolerances_for_units(units)
                 row["ok"] = math.isclose(float(computed), float(expected), rel_tol=rel_tol, abs_tol=abs_tol)
 
         except Exception as e:
@@ -215,7 +231,7 @@ def verify_math_claims(claims_json: dict, rel_tol=1e-6, abs_tol=1.0):
 def math_gate_ok(text: str):
     block = extract_json_block(text)
     if not block:
-        return False, "No ```json``` block found in Math Claims section"
+        return False, "No fenced ```json``` block found in Math Claims section"
     try:
         claims = json.loads(block)
     except Exception as e:
@@ -391,8 +407,8 @@ MASTER_FORMAT = "\n".join([
     "## Assumptions Added by Master",
     "",
     "## Financing Treatment of Shock/Overrun (MANDATORY)",
-    "- Case A (Debt capped): debt stays at base; overrun equity-funded (equity increases by full overrun).",
-    "- Case B (Pro-rata 60/40): incremental overrun funded 60/40 (debt +60%*overrun, equity +40%*overrun).",
+    "- Case A (Debt capped): debt stays at base; overrun equity-funded (equity = base equity + overrun).",
+    "- Case B (Pro-rata 60/40): debt += 0.6*overrun; equity += 0.4*overrun.",
     "",
     "## Executive Answer",
     "",
@@ -409,7 +425,7 @@ MASTER_FORMAT = "\n".join([
     "## Claims Audit",
     "",
     "## Math Claims (JSON)",
-    "Provide exactly one JSON block with this schema:",
+    "Provide exactly one JSON block in this schema:",
     "```json",
     "{",
     '  "claims": [',
@@ -425,22 +441,7 @@ MASTER_FORMAT = "\n".join([
     "}",
     "```",
     "",
-    "PMT claim must use inputs keys: rate (decimal), nper, pv.",
-    "Example:",
-    "```json",
-    "{",
-    '  "claims": [',
-    "    {",
-    '      "id": "debt_service",',
-    '      "type": "pmt",',
-    '      "inputs": {"rate": 0.065, "nper": 20, "pv": 1920000000},',
-    '      "expected": -175000000,',
-    '      "units": "USD_per_year"',
-    "    }",
-    "  ]",
-    "}",
-    "```",
-    "",
+    "PMT claim inputs MUST use keys: rate (decimal), nper, pv.",
     "## Confidence",
 ])
 
@@ -449,16 +450,16 @@ MASTER_SYSTEM_STRICT = "\n".join([
     "Rules:",
     "- Do NOT add numeric assumptions.",
     "- If blocking inputs exist, do NOT state threshold outcomes as likely; say cannot determine.",
-    "- Any computed number must be backed by Math Claims JSON (schema must be valid).",
+    "- Any computed number must be backed by Math Claims JSON (schema must be valid and fenced).",
 ])
 
 MASTER_SYSTEM_ASSUME = "\n".join([
     "You are Nemexis Master (ASSUMPTION MODE).",
     "Rules:",
     "- Use the Assumption Pack to fill missing values; tag each [Assumed]. Prefer ranges + sensitivity.",
-    "- Case A definition: debt stays at base; overrun equity-funded (equity = base equity + overrun).",
-    "- Case B definition: incremental overrun funded 60/40 (debt += 0.6*overrun; equity += 0.4*overrun).",
-    "- Any computed number must be backed by Math Claims JSON with VALID schema.",
+    "- Case A: debt stays at base; equity = base equity + overrun (NOT 40% of total).",
+    "- Case B: debt += 0.6*overrun; equity += 0.4*overrun.",
+    "- Any computed number must be backed by a fenced Math Claims JSON block with VALID schema.",
 ])
 
 def build_user_text():
@@ -488,8 +489,19 @@ def run_master_assume(feedback: str):
     ])
     return leader_call(MASTER_SYSTEM_ASSUME, master_input, temperature=0.25)
 
+def ensure_fenced_json(draft_fn, max_tries=2, title=""):
+    """
+    Calls draft_fn() up to max_tries until we see a fenced json block.
+    """
+    last = None
+    for attempt in range(1, max_tries + 1):
+        last = draft_fn()
+        if extract_json_block(last) is not None:
+            return last, attempt, None
+    return last, max_tries, "Missing fenced ```json``` block after retries"
+
 # ----------------------------
-# STRICT run (auto retry once if math fails)
+# STRICT run (auto retry once if json fence or math fails)
 # ----------------------------
 if run_strict:
     if not user_prompt.strip():
@@ -499,12 +511,22 @@ if run_strict:
     st.divider()
     st.markdown("## STRICT Result")
 
-    draft = run_master_strict()
-    ok_math, _ = render_math_table(draft, "STRICT (attempt 1)")
+    def strict_call():
+        return run_master_strict()
+
+    draft, tries, fence_err = ensure_fenced_json(strict_call, max_tries=2)
+    if fence_err:
+        st.error(fence_err)
+
+    ok_math, _ = render_math_table(draft, f"STRICT (try {tries})")
     if not ok_math:
-        st.warning("STRICT failed math schema/verification. Auto-retrying once…")
-        draft = run_master_strict()
-        ok_math, _ = render_math_table(draft, "STRICT (attempt 2)")
+        st.warning("STRICT math failed. Auto-retrying once more…")
+        draft2, tries2, fence_err2 = ensure_fenced_json(strict_call, max_tries=2)
+        if fence_err2:
+            st.error(fence_err2)
+        ok_math2, _ = render_math_table(draft2, f"STRICT retry (try {tries2})")
+        draft = draft2
+        ok_math = ok_math2
 
     st.write(draft)
     blockers = parse_blocking_items(draft)
@@ -512,7 +534,7 @@ if run_strict:
     st.write(blockers if blockers else ["None"])
 
 # ----------------------------
-# ASSUMPTION iterative (schema enforced)
+# ASSUMPTION iterative (schema enforced + fenced json enforced)
 # ----------------------------
 if run_assume:
     if not user_prompt.strip():
@@ -538,15 +560,22 @@ if run_assume:
                 f"- Issues: {prev['issues']}",
                 "",
                 "Rules:",
-                "- Math Claims JSON must be valid schema and match prose.",
-                "- Fix Case A / Case B definitions if wrong.",
+                "- Math Claims JSON must be fenced and valid schema and match prose.",
+                "- Fix Case A / Case B definitions (Case A equity = base equity + overrun).",
                 "- In ASSUMPTION mode, Blocking should be NONE (fill gaps explicitly).",
+                "- For PMT claims, use inputs keys: rate,nper,pv. rate must be decimal (0.065).",
             ])
 
-        draft = run_master_assume(feedback)
+        def assume_call():
+            return run_master_assume(feedback)
+
+        draft, tries, fence_err = ensure_fenced_json(assume_call, max_tries=2, title=f"ASSUMPTION iter {it}")
+        if fence_err:
+            st.error(f"[Iter {it}] {fence_err}")
+
         st.write(draft)
 
-        ok_math, _ = render_math_table(draft, f"ASSUMPTION iter {it}")
+        ok_math, _ = render_math_table(draft, f"ASSUMPTION iter {it} (try {tries})")
         blockers = parse_blocking_items(draft)
 
         issues = []

@@ -12,19 +12,14 @@ import streamlit.components.v1 as components
 from simpleeval import SimpleEval
 
 # ============================
-# Nemexis v7 — Accuracy-First Convergence
-# Goal (Mode A): Iterate until 0 blocking inputs remain AND all gates pass.
-# Gates:
-#  1) Deterministic math claims verified
-#  2) Guardrail checker: no violations
-#  3) Blocking inputs: NONE
-#  4) Claude & Grok: no critical must-fix items
-#
-# If cannot converge within max_iters, stop and report remaining blockers.
+# Nemexis v8 — Two-button workflow
+# - STRICT: no numeric assumptions; stops if blockers exist
+# - ASSUMPTION: fills gaps with explicit assumptions (tagged), iterates to convergence
+# Deterministic math verifier: any [Computed] number must appear as a Math Claim and verify.
 # ============================
 
-st.set_page_config(page_title="Nemexis v7", layout="wide")
-st.title("Nemexis v7 — Accuracy-First Reliability Engine (0 Blocking Inputs)")
+st.set_page_config(page_title="Nemexis v8", layout="wide")
+st.title("Nemexis v8 — Reliability Engine (STRICT + ASSUMPTION)")
 
 # ----------------------------
 # Password Gate (optional)
@@ -189,7 +184,6 @@ def math_gate_ok(text: str):
     except Exception as e:
         return False, f"Math Claims JSON parse error: {e}"
     results = verify_math_claims(claims)
-    # Any error or mismatch fails
     for r in results:
         if r["error"] is not None:
             return False, f"Math verifier error in claim {r['id']}: {r['error']}"
@@ -197,38 +191,37 @@ def math_gate_ok(text: str):
             return False, f"Math mismatch in claim {r['id']}"
     return True, results
 
+def render_math_table(text: str, title: str):
+    st.markdown(f"### Math Verification — {title}")
+    ok, info = math_gate_ok(text)
+    if ok is True and isinstance(info, list):
+        st.table(info)
+        st.success("All declared math claims verified ✅")
+    else:
+        st.error(f"Math verification failed: {info}")
+    return ok, info
+
 # ----------------------------
-# Parse Blocking Inputs from Master output
+# Blocking inputs parsing
 # ----------------------------
 def parse_blocking_items(text: str):
-    """
-    Extract bullet lines under '## Missing Inputs' -> '### Blocking'
-    Returns list of strings.
-    """
-    # Find section
-    m = re.search(r"## Missing Inputs.*?### Blocking(.*?)(### Non-blocking|## Claims Audit|## Confidence|$)", text, flags=re.S | re.I)
+    m = re.search(r"## Missing Inputs.*?### Blocking(.*?)(### Non-blocking|## Claims Audit|## Confidence|## Math Claims|$)", text, flags=re.S | re.I)
     if not m:
-        return ["(Missing Inputs/Blocking section not found)"]
-
+        return ["(Blocking section not found)"]
     block = m.group(1).strip()
     if not block:
         return []
-
-    # If explicitly says None
-    if re.search(r"\bnone\b", block, flags=re.I):
-        # still could have bullets; treat as none only if no bullets
-        bullets = re.findall(r"^\s*-\s+(.*)$", block, flags=re.M)
-        if len(bullets) == 0:
-            return []
-
+    # bullets or numbered
     bullets = re.findall(r"^\s*-\s+(.*)$", block, flags=re.M)
-    # Also allow numbered items
     nums = re.findall(r"^\s*\d+\.\s+(.*)$", block, flags=re.M)
-    items = [b.strip() for b in bullets + nums if b.strip()]
+    items = [x.strip() for x in (bullets + nums) if x.strip()]
+    # treat "None" as empty if no bullets
+    if not items and re.search(r"\bnone\b", block, flags=re.I):
+        return []
     return items if items else ["(No bullet items found under Blocking)"]
 
 # ----------------------------
-# Reviewer rubric (Claude/Grok) in JSON
+# Reviewer rubric JSON prompt
 # ----------------------------
 RUBRIC_PROMPT = "\n".join([
     "You are a reviewer. Critique the draft and output ONLY a JSON object.",
@@ -236,27 +229,23 @@ RUBRIC_PROMPT = "\n".join([
     "{",
     '  "overall_score_0_5": 0,',
     '  "critical_must_fix": [],',
-    '  "blocking_inputs_remaining": [],',
     '  "notes": ""',
     "}",
     "",
     "Rules:",
     "- overall_score_0_5 must be a number from 0 to 5.",
     "- critical_must_fix: list of short bullets. Empty list means no must-fix.",
-    "- blocking_inputs_remaining: list of inputs that must be provided to reach a fully defensible answer.",
     "- notes: 1–3 sentences max.",
     "- Do not include any other text.",
 ])
 
 def parse_reviewer_json(text: str):
-    # Find first { ... } block heuristically
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         return None, "No JSON object found"
     try:
-        obj = json.loads(text[start:end+1])
-        return obj, None
+        return json.loads(text[start:end+1]), None
     except Exception as e:
         return None, str(e)
 
@@ -308,26 +297,41 @@ def call_grok(model_name: str, system: str, user_text: str) -> str:
     return last_err or "❌ Grok Error: unknown"
 
 # ----------------------------
-# Universal Strict instructions to Master
+# Master instructions
 # ----------------------------
-MASTER_SYSTEM = "\n".join([
-    "You are Nemexis Master (Accuracy-first).",
-    "You must produce an answer that can be accepted by an Investment Committee / technical board.",
-    "You must NOT invent missing numeric inputs.",
-    "Any number labeled [Computed] MUST be declared in Math Claims JSON and must verify deterministically.",
-    "If Blocking inputs remain, you must not claim threshold outcomes as 'likely'. You may say 'cannot determine'.",
+MASTER_SYSTEM_STRICT = "\n".join([
+    "You are Nemexis Master (STRICT).",
+    "Rules:",
+    "- Do NOT invent missing numeric inputs.",
+    "- If blocking inputs remain, do NOT use 'likely' for threshold crossings; say 'cannot determine'.",
+    "- Any [Computed] number MUST be declared in Math Claims JSON and must verify deterministically.",
+    "- DSCR is based on CFADS, not EBITDA.",
+    "- Present Financing Treatment with Case A and Case B as scenarios (not facts).",
+])
+
+MASTER_SYSTEM_ASSUMPTION = "\n".join([
+    "You are Nemexis Master (ASSUMPTION MODE).",
+    "Rules:",
+    "- You may fill gaps, but every filled gap must be explicitly listed under 'Assumptions Added by Master' and tagged [Assumed].",
+    "- Prefer ranges and scenario table when uncertain.",
+    "- Any [Computed] number MUST be declared in Math Claims JSON and must verify deterministically.",
+    "- Do not contradict user-provided inputs.",
+    "- Separate Facts (Known) vs Assumptions vs Computed.",
 ])
 
 MASTER_FORMAT = "\n".join([
     "Return in this exact structure:",
+    "",
+    "## Mode Banner",
+    "- STRICT or ASSUMPTION",
     "",
     "## Inputs Used (Verbatim)",
     "",
     "## Assumptions Added by Master",
     "",
     "## Financing Treatment of Shock/Overrun (MANDATORY)",
-    "- Case A: Debt capped; overrun equity-funded.",
-    "- Case B: Debt upsized requires lender consent and CFADS/DSCR headroom.",
+    "- Case A: Debt capped; overrun equity-funded (scenario).",
+    "- Case B: Debt upsized requires lender consent + headroom (scenario).",
     "",
     "## Executive Answer",
     "",
@@ -344,28 +348,14 @@ MASTER_FORMAT = "\n".join([
     "## Claims Audit",
     "",
     "## Math Claims (JSON)",
-    "Provide a single JSON block with triple backticks like:",
-    "```json",
-    "{",
-    '  "claims": [',
-    "    {",
-    '      "id": "capex_overrun",',
-    '      "type": "arithmetic",',
-    '      "expr": "CAPEX*0.15",',
-    '      "inputs": {"CAPEX": 3200000000},',
-    '      "expected": 480000000,',
-    '      "units": "USD"',
-    "    }",
-    "  ]",
-    "}",
-    "```",
+    "Provide a single JSON block with triple backticks.",
     "",
     "Rules for Math Claims:",
-    "- Include ONLY claims computable from provided inputs.",
-    "- Do NOT include DSCR/CFADS/IRR unless explicit cashflows/schedules are provided.",
+    "- Include ONLY claims computable from provided inputs + explicitly stated assumptions.",
+    "- If you compute a number, include it here with expected matching the prose.",
+    "- Use arithmetic / pmt / npv / irr only when inputs are complete.",
     "",
     "## Confidence",
-    "- Must be LOW if Blocking inputs exist.",
 ])
 
 # ----------------------------
@@ -375,165 +365,176 @@ st.markdown("### Inputs")
 prompt = st.text_area("User Prompt", height=180)
 context = st.text_area("Context (optional)", height=150)
 
-st.markdown("### Settings")
-master_model = st.selectbox("Master model (OpenAI)", ["gpt-4o-mini", "gpt-4o"], index=0)
-claude_model = st.selectbox(
-    "Claude critic model",
-    ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"],
-    index=0,
-)
-grok_model = st.selectbox("Grok critic model", ["grok-4-fast", "grok-4"], index=0)
+st.markdown("### Models")
+master_model = st.selectbox("Master (OpenAI)", ["gpt-4o-mini", "gpt-4o"], index=0)
+claude_model = st.selectbox("Claude", ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"], index=0)
+grok_model = st.selectbox("Grok", ["grok-4-fast", "grok-4"], index=0)
 
-max_iters = st.slider("Max iterations", min_value=2, max_value=10, value=5)
-run = st.button("Run Nemexis (iterate to 0 blocking inputs)")
+st.markdown("### Controls")
+col_run1, col_run2 = st.columns(2)
+with col_run1:
+    run_strict = st.button("Run STRICT (Audit)")
+with col_run2:
+    run_assume = st.button("Run ASSUMPTION (Fill gaps)")
+
+max_iters = st.slider("Max iterations (ASSUMPTION mode)", 2, 8, 4)
+
+# Persistent “blocker fill” box
+st.markdown("### Provide Missing Inputs (optional)")
+st.caption("If STRICT reports blockers, paste answers here and re-run STRICT.")
+blocker_input = st.text_area("Blocker Inputs (paste O&M, CFADS bridge, debt schedule, CAPEX phasing, etc.)", height=140)
 
 # ----------------------------
-# Main loop
+# Run logic
 # ----------------------------
-if run:
+def run_engine(mode_name: str):
     if not prompt.strip():
-        st.error("Please enter a User Prompt.")
-        st.stop()
+        st.error("Please enter a prompt.")
+        return None
 
     user_text = prompt.strip()
     if context.strip():
         user_text += "\n\n---\nContext:\n" + context.strip()
+    if blocker_input.strip():
+        user_text += "\n\n---\nUser-provided answers to missing inputs:\n" + blocker_input.strip()
 
-    history = []
-    converged = False
-    remaining_blockers = None
-    final_draft = None
-    final_reviews = None
-    final_math = None
+    return user_text
+
+def reviewer_rubrics(draft: str):
+    # Claude
+    claude_raw = call_claude(claude_model, "You are a strict reviewer.", draft + "\n\n" + RUBRIC_PROMPT)
+    claude_obj, err = parse_reviewer_json(claude_raw)
+    if claude_obj is None:
+        claude_obj = {"overall_score_0_5": 0, "critical_must_fix": ["Could not parse Claude JSON"], "notes": err or ""}
+
+    # Grok
+    grok_raw = call_grok(grok_model, "You are a strict reviewer.", draft + "\n\n" + RUBRIC_PROMPT)
+    grok_obj, err2 = parse_reviewer_json(grok_raw)
+    if grok_obj is None:
+        grok_obj = {"overall_score_0_5": 0, "critical_must_fix": ["Could not parse Grok JSON"], "notes": err2 or ""}
+
+    return claude_obj, grok_obj
+
+# ----------------------------
+# STRICT run
+# ----------------------------
+if run_strict:
+    user_text = run_engine("STRICT")
+    if user_text is None:
+        st.stop()
 
     st.divider()
-    st.markdown("## Iterations")
+    st.markdown("## STRICT Output")
+
+    master_input = "\n\n".join([
+        "MODE: STRICT",
+        "USER PROMPT:",
+        user_text,
+        "OUTPUT FORMAT:",
+        MASTER_FORMAT
+    ])
+
+    with st.spinner("Master (STRICT) drafting..."):
+        draft = call_openai(master_model, MASTER_SYSTEM_STRICT, master_input, temperature=0.15)
+
+    st.write(draft)
+    ok_math, info = render_math_table(draft, "STRICT")
+    blockers = parse_blocking_items(draft)
+
+    st.markdown("### Blocking inputs detected")
+    st.write(blockers if blockers else ["None"])
+
+    claude_obj, grok_obj = reviewer_rubrics(draft)
+    st.markdown("### Claude rubric")
+    st.json(claude_obj)
+    st.markdown("### Grok rubric")
+    st.json(grok_obj)
+
+    if blockers:
+        st.warning("STRICT found blocking inputs. Provide them in the box above, then re-run STRICT, or switch to ASSUMPTION mode.")
+
+# ----------------------------
+# ASSUMPTION run (iterative)
+# ----------------------------
+if run_assume:
+    user_text = run_engine("ASSUMPTION")
+    if user_text is None:
+        st.stop()
+
+    st.divider()
+    st.markdown("## ASSUMPTION Output (Iterative)")
+
+    history = []
+    final_draft = None
 
     for it in range(1, max_iters + 1):
         st.markdown(f"### Iteration {it}")
 
-        # Draft prompt includes last critiques if present
-        last_feedback = ""
+        feedback = ""
         if history:
-            last = history[-1]
-            last_feedback = "\n\n".join([
+            prev = history[-1]
+            feedback = "\n\n".join([
                 "PREVIOUS ITERATION FEEDBACK (must address):",
-                f"- Blocking inputs remaining: {last['blocking']}",
-                f"- Claude critical must-fix: {last['claude']['critical_must_fix']}",
-                f"- Grok critical must-fix: {last['grok']['critical_must_fix']}",
-                "Fix any math-claim inconsistencies and ensure Math Claims JSON matches prose.",
+                f"- Blocking inputs remaining: {prev['blockers']}",
+                f"- Claude must-fix: {prev['claude']['critical_must_fix']}",
+                f"- Grok must-fix: {prev['grok']['critical_must_fix']}",
+                "- Ensure Math Claims JSON matches all [Computed] numbers.",
+                "- Ensure assumptions are explicitly listed and labeled [Assumed].",
             ])
 
         master_input = "\n\n".join([
+            "MODE: ASSUMPTION",
             "USER PROMPT:",
             user_text,
-            last_feedback,
+            feedback,
             "OUTPUT FORMAT:",
             MASTER_FORMAT
         ])
 
-        with st.spinner("Master drafting..."):
-            draft = call_openai(master_model, MASTER_SYSTEM, master_input, temperature=0.15)
+        with st.spinner("Master (ASSUMPTION) drafting..."):
+            draft = call_openai(master_model, MASTER_SYSTEM_ASSUMPTION, master_input, temperature=0.25)
 
         st.write(draft)
+        ok_math, _ = render_math_table(draft, f"ASSUMPTION Iter {it}")
 
-        # Gate 1: parse blocking inputs
-        blocking = parse_blocking_items(draft)
+        blockers = parse_blocking_items(draft)
+        claude_obj, grok_obj = reviewer_rubrics(draft)
 
-        # Gate 2: math claims verified
-        math_ok, math_info = math_gate_ok(draft)
-
-        # Reviewers: Claude + Grok rubric JSON
-        with st.spinner("Claude scoring..."):
-            claude_review_raw = call_claude(claude_model, "You are a strict reviewer.", draft + "\n\n" + RUBRIC_PROMPT)
-        claude_obj, claude_err = parse_reviewer_json(claude_review_raw)
-        if claude_obj is None:
-            claude_obj = {"overall_score_0_5": 0, "critical_must_fix": ["Could not parse Claude JSON"], "blocking_inputs_remaining": [], "notes": claude_err or ""}
-
-        with st.spinner("Grok scoring..."):
-            grok_review_raw = call_grok(grok_model, "You are a strict reviewer.", draft + "\n\n" + RUBRIC_PROMPT)
-        grok_obj, grok_err = parse_reviewer_json(grok_review_raw)
-        if grok_obj is None:
-            grok_obj = {"overall_score_0_5": 0, "critical_must_fix": ["Could not parse Grok JSON"], "blocking_inputs_remaining": [], "notes": grok_err or ""}
-
-        st.markdown("**Claude rubric:**")
+        st.markdown("**Claude rubric**")
         st.json(claude_obj)
-        st.markdown("**Grok rubric:**")
+        st.markdown("**Grok rubric**")
         st.json(grok_obj)
 
-        # Convergence rule (Mode A)
-        # - blocking must be empty or explicitly 'None'
-        blocking_is_zero = (len(blocking) == 0) or (len(blocking) == 1 and "not found" not in blocking[0].lower() and "no bullet" not in blocking[0].lower() and blocking[0].strip().lower() == "none")
-        # Also treat "(...not found)" as not converged
-        if len(blocking) == 1 and blocking[0].startswith("("):
-            blocking_is_zero = False
+        no_critical = (len(claude_obj.get("critical_must_fix", [])) == 0 and len(grok_obj.get("critical_must_fix", [])) == 0)
 
-        no_critical = (len(claude_obj.get("critical_must_fix", [])) == 0) and (len(grok_obj.get("critical_must_fix", [])) == 0)
-
-        # Store iteration record
         history.append({
             "iter": it,
             "draft": draft,
-            "blocking": blocking,
-            "math_ok": math_ok,
-            "math_info": math_info,
+            "ok_math": ok_math,
+            "blockers": blockers,
             "claude": claude_obj,
-            "grok": grok_obj,
+            "grok": grok_obj
         })
 
-        # Display gate status
-        st.markdown("#### Gate Status")
-        st.write({
-            "blocking_inputs": blocking,
-            "math_verified": math_ok,
-            "no_critical_must_fix": no_critical,
-        })
-
-        # Decide stop/continue
-        if blocking_is_zero and math_ok and no_critical:
-            converged = True
+        # Convergence for assumption mode:
+        # - math verified
+        # - no critical must-fix
+        # - blockers empty or explicitly "None"
+        blockers_empty = (len(blockers) == 0)
+        if ok_math and no_critical and blockers_empty:
+            st.success("✅ Converged in ASSUMPTION mode.")
             final_draft = draft
-            final_reviews = {"claude": claude_obj, "grok": grok_obj}
-            final_math = math_info
-            remaining_blockers = []
             break
         else:
             final_draft = draft
-            final_reviews = {"claude": claude_obj, "grok": grok_obj}
-            final_math = math_info
-            remaining_blockers = blocking
-
-            # If blocking inputs exist, we cannot “iterate them away” without user data.
-            # So we stop early and tell the user what is needed.
-            if not blocking_is_zero:
-                st.warning("Cannot reach 0 blocking inputs without additional data. Stopping early to avoid meaningless looping.")
-                break
 
     st.divider()
-    st.markdown("## Final Result")
-
-    if converged:
-        st.success("✅ Converged: 0 blocking inputs + math verified + no critical must-fix.")
-    else:
-        st.error("❌ Not converged to 0 blocking inputs.")
-        st.write("Remaining blocking inputs:", remaining_blockers)
-
-    st.markdown("### Final Draft")
+    st.markdown("## Final ASSUMPTION Draft")
     st.write(final_draft)
 
-    st.markdown("### Final Math Verification")
-    if isinstance(final_math, list):
-        st.table(final_math)
-    else:
-        st.write(final_math)
-
-    st.markdown("### Final Reviewer Rubrics")
-    st.json(final_reviews)
-
-    # Export
     export_text = f"""# Nemexis Export
 Generated: {datetime.datetime.now()}
-Mode: Accuracy-first (0 Blocking Inputs)
+MODE: ASSUMPTION (iterative)
 
 ## USER PROMPT
 {prompt.strip()}
@@ -541,11 +542,8 @@ Mode: Accuracy-first (0 Blocking Inputs)
 ## CONTEXT
 {context.strip() if context.strip() else "(none)"}
 
-## CONVERGED
-{converged}
-
-## REMAINING BLOCKERS
-{remaining_blockers}
+## USER PROVIDED BLOCKER INPUTS
+{blocker_input.strip() if blocker_input.strip() else "(none)"}
 
 ---
 
@@ -554,24 +552,19 @@ Mode: Accuracy-first (0 Blocking Inputs)
 
 ---
 
-## FINAL REVIEWS
-{json.dumps(final_reviews, indent=2)}
-
----
-
 ## HISTORY
 """
     for h in history:
         export_text += f"\n\n### Iteration {h['iter']}\n"
-        export_text += f"- Blocking: {h['blocking']}\n"
-        export_text += f"- Math OK: {h['math_ok']}\n"
-        export_text += f"- Claude critical: {h['claude'].get('critical_must_fix', [])}\n"
-        export_text += f"- Grok critical: {h['grok'].get('critical_must_fix', [])}\n"
+        export_text += f"- Math OK: {h['ok_math']}\n"
+        export_text += f"- Blocking: {h['blockers']}\n"
+        export_text += f"- Claude must-fix: {h['claude'].get('critical_must_fix', [])}\n"
+        export_text += f"- Grok must-fix: {h['grok'].get('critical_must_fix', [])}\n"
         export_text += "\n---\n"
         export_text += h["draft"]
 
     st.divider()
     st.markdown("## Export")
-    copy_to_clipboard_button(export_text, "📋 Copy Everything")
+    copy_to_clipboard_button(export_text, "📋 Copy Everything (ASSUMPTION)")
     st.download_button("⬇️ Download Markdown", export_text, file_name="nemexis_output.md", mime="text/markdown")
     st.text_area("All output (Cmd/Ctrl+A then Copy)", value=export_text, height=320)

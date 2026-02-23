@@ -11,8 +11,35 @@ import requests
 import streamlit.components.v1 as components
 from simpleeval import SimpleEval
 
-st.set_page_config(page_title="Nemexis v10.3.3", layout="wide")
-st.title("Nemexis v10.3.3 — Universal Reliability (Math Normalizer + Required Claims + Verified Synthesis)")
+# =====================================================
+# Nemexis v10.3.4 — Universal Hard Gates
+#
+# Fixes the remaining "Math OK but nonsense" problem by adding:
+# 1) REQUIRED ID CONTRACT:
+#    - each required id must have correct type + required keys
+#    - prevents pmt_case_a being emitted as arithmetic, etc.
+# 2) TIME BASIS COHERENCE:
+#    - PMT claims must match selected time basis (units + nper scale)
+# 3) SCENARIO BALANCE + ALLOCATION CHECKS (universal):
+#    Uses user-selected debt_ratio/equity_ratio (default 60/40) to validate:
+#    - base_capex = base_debt + base_equity
+#    - incremental_allocation:
+#        Case A: debt_case_a = base_debt; equity_case_a = base_equity + overrun
+#        Case B: debt_case_b = base_debt + debt_ratio*overrun
+#                equity_case_b = base_equity + equity_ratio*overrun
+#    - total_rebalance:
+#        debt_case_b = debt_ratio*(base_capex + overrun)
+#        equity_case_b = equity_ratio*(base_capex + overrun)
+#    - capped_variable:
+#        enforces that at least one of debt_case_a/base_debt or equity_case_a/base_equity matches exactly
+#
+# 4) STILL UNIVERSAL:
+#    - supports human numeric notations in EXPR (3.2B, 60%) via normalizer
+#    - but requires JSON numeric inputs to be plain numbers (no "B", no "%")
+# =====================================================
+
+st.set_page_config(page_title="Nemexis v10.3.4", layout="wide")
+st.title("Nemexis v10.3.4 — Universal Reliability Engine (Typed Claims + Scenario Gates)")
 
 # ----------------------------
 # Secrets
@@ -30,7 +57,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 # ----------------------------
-# Password UX (button + state)
+# Password UX
 # ----------------------------
 if "unlocked" not in st.session_state:
     st.session_state["unlocked"] = False
@@ -39,7 +66,6 @@ if APP_PASSWORD:
     st.markdown("### Access")
     pw = st.text_input("Password", type="password", value="", placeholder="Enter password")
     unlock = st.button("Unlock")
-
     if unlock:
         if pw == APP_PASSWORD:
             st.session_state["unlocked"] = True
@@ -47,7 +73,6 @@ if APP_PASSWORD:
         else:
             st.session_state["unlocked"] = False
             st.error("Wrong password ❌")
-
     if not st.session_state["unlocked"]:
         st.stop()
 
@@ -120,87 +145,66 @@ def irr(cashflows, guess=0.1, max_iter=100, tol=1e-7):
     raise ValueError("IRR did not converge")
 
 # ----------------------------
-# Universal hard requirement: claim IDs (scenario arithmetic + PMTs)
-# ----------------------------
-REQUIRED_CLAIM_IDS = {
-    "capex_overrun",
-    "base_debt",
-    "base_equity",
-    "equity_case_a",
-    "debt_case_a",
-    "equity_case_b",
-    "debt_case_b",
-    "pmt_case_a",
-    "pmt_case_b",
-}
-
-# ----------------------------
-# Math normalization utilities (UNIVERSAL)
+# Universal numeric normalizer for expr (NOT for JSON numbers)
 # ----------------------------
 SUFFIX_MULT = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}
 
 def normalize_expr(expr: str) -> str:
-    """
-    Universal normalization for LLM/human-style math:
-    - 3,200,000 -> 3200000
-    - 60% -> 0.60
-    - 3.2B -> (3.2*1e9)
-    - 92M -> (92*1e6)
-    - 1.92b -> (1.92*1e9)
-    """
     if expr is None:
         return ""
     s = str(expr)
-
-    # remove commas in numbers: 3,200,000 -> 3200000
     s = re.sub(r"(?<=\d),(?=\d)", "", s)
-
-    # percent: 60% -> 0.60
     s = re.sub(r"(\d+(\.\d+)?)\s*%", lambda m: str(float(m.group(1)) / 100.0), s)
 
-    # suffix: 3.2B / 92M / 10k
     def repl_suffix(m):
         num = float(m.group(1))
-        suf = m.group(3).lower()
+        suf = m.group(3).lower().strip()
         mult = SUFFIX_MULT.get(suf, 1.0)
         return f"({num}*{mult})"
 
     s = re.sub(r"(\d+(\.\d+)?)(\s*[kKmMbBtT])\b", repl_suffix, s)
-
     return s
 
 def normalize_number(x):
-    """
-    Normalize numeric inputs that might come as strings with suffixes.
-    """
     if isinstance(x, (int, float)):
         return x
     if x is None:
         return x
-    s = str(x).strip()
-    s = s.replace(",", "")
-    # percent string
+    s = str(x).strip().replace(",", "")
     if s.endswith("%"):
         try:
             return float(s[:-1]) / 100.0
         except:
             return x
-    # suffix string
     m = re.fullmatch(r"(\d+(\.\d+)?)([kKmMbBtT])", s)
     if m:
         num = float(m.group(1))
         mult = SUFFIX_MULT[m.group(3).lower()]
         return num * mult
-    # plain float/int
     try:
-        if "." in s:
-            return float(s)
-        return int(s)
+        return float(s) if "." in s else int(s)
     except:
         return x
 
 # ----------------------------
-# Math claims parsing/verification + auto-repair
+# REQUIRED CLAIM CONTRACT (universal)
+# ----------------------------
+REQUIRED_CONTRACT = {
+    "capex_overrun": {"type": "arithmetic", "units_kind": "usd"},
+    "base_debt": {"type": "arithmetic", "units_kind": "usd"},
+    "base_equity": {"type": "arithmetic", "units_kind": "usd"},
+    "debt_case_a": {"type": "arithmetic", "units_kind": "usd"},
+    "equity_case_a": {"type": "arithmetic", "units_kind": "usd"},
+    "debt_case_b": {"type": "arithmetic", "units_kind": "usd"},
+    "equity_case_b": {"type": "arithmetic", "units_kind": "usd"},
+    "pmt_case_a": {"type": "pmt", "units_kind": "pmt"},
+    "pmt_case_b": {"type": "pmt", "units_kind": "pmt"},
+}
+
+REQUIRED_IDS = set(REQUIRED_CONTRACT.keys())
+
+# ----------------------------
+# Math Claims parsing + auto-repair (expected/units), but NOT type for required IDs
 # ----------------------------
 def extract_json_block(text: str) -> str | None:
     marker = "```json"
@@ -228,7 +232,7 @@ def _tolerances_for_units(units: str):
         return 1e-6, 1e-4
     return 1e-6, 1.0
 
-def _default_units_for_claim(claim_type: str, time_basis: str):
+def _default_units_for_claim(claim_id: str, claim_type: str, time_basis: str):
     if claim_type == "pmt":
         return "USD_per_year" if time_basis == "annual" else "USD_per_month"
     return "USD"
@@ -236,13 +240,11 @@ def _default_units_for_claim(claim_type: str, time_basis: str):
 def _compute_claim_value(claim: dict):
     ctype = claim.get("type")
     inputs = claim.get("inputs") or {}
-
     if ctype == "arithmetic":
         expr = normalize_expr(claim.get("expr", ""))
         se = SimpleEval()
         se.names = dict(inputs)
         return se.eval(expr)
-
     if ctype == "pmt":
         return pmt(**inputs)
     if ctype == "npv":
@@ -252,66 +254,60 @@ def _compute_claim_value(claim: dict):
     raise ValueError(f"Unknown claim type: {ctype}")
 
 def coerce_claim(c: dict, time_basis: str, idx: int):
-    """
-    Accepts flexible claim formats and normalizes into standard schema:
-    {id, type, inputs, expected, units, (expr for arithmetic)}
-    """
     fixed = dict(c)
 
-    # allow {id, value} style
-    if "value" in fixed and "expr" not in fixed and "inputs" not in fixed:
+    # accept {id, value} as arithmetic ONLY for NON-required ids
+    if "value" in fixed and ("expr" not in fixed and "inputs" not in fixed):
+        if fixed.get("id") in REQUIRED_IDS:
+            raise ValueError("Required id cannot be value-only; must provide proper type/expr/inputs")
         fixed.setdefault("type", "arithmetic")
         fixed["expr"] = "value"
         fixed["inputs"] = {"value": normalize_number(fixed["value"])}
 
-    # if type missing but expr exists -> arithmetic
-    if "type" not in fixed and "expr" in fixed:
+    # infer arithmetic only if type missing AND id is not required
+    if "type" not in fixed and "expr" in fixed and fixed.get("id") not in REQUIRED_IDS:
         fixed["type"] = "arithmetic"
 
     if "id" not in fixed or not str(fixed["id"]).strip():
         fixed["id"] = f"claim_{idx}"
 
+    # inputs must exist
     if "inputs" not in fixed or fixed["inputs"] is None:
         fixed["inputs"] = {}
 
-    # normalize all inputs numbers
-    if isinstance(fixed["inputs"], dict):
-        fixed["inputs"] = {k: normalize_number(v) for k, v in fixed["inputs"].items()}
-    else:
-        raise ValueError(f"Claim #{idx} inputs must be object")
+    if not isinstance(fixed["inputs"], dict):
+        raise ValueError("inputs must be an object")
 
-    if "units" not in fixed or not str(fixed["units"]).strip():
-        fixed["units"] = _default_units_for_claim(fixed["type"], time_basis)
+    # normalize inputs numbers
+    fixed["inputs"] = {k: normalize_number(v) for k, v in fixed["inputs"].items()}
+
+    # ensure type
+    if "type" not in fixed or fixed["type"] is None:
+        raise ValueError("missing type")
+    fixed["type"] = str(fixed["type"]).strip().lower()
 
     # arithmetic needs expr
     if fixed["type"] == "arithmetic":
         if "expr" not in fixed or fixed["expr"] is None:
-            raise ValueError(f"Arithmetic claim {fixed['id']} missing expr")
+            raise ValueError("arithmetic missing expr")
         fixed["expr"] = normalize_expr(fixed["expr"])
 
-    # pmt needs rate,nper,pv
+    # pmt schema
     if fixed["type"] == "pmt":
         req = {"rate", "nper", "pv"}
         if not req.issubset(set(fixed["inputs"].keys())):
-            raise ValueError(f"PMT claim {fixed['id']} inputs must include {sorted(list(req))}")
+            raise ValueError(f"pmt inputs must include {sorted(list(req))}")
 
-    if fixed["type"] == "npv":
-        req = {"rate", "cashflows"}
-        if not req.issubset(set(fixed["inputs"].keys())):
-            raise ValueError(f"NPV claim {fixed['id']} inputs must include {sorted(list(req))}")
-
-    if fixed["type"] == "irr":
-        req = {"cashflows"}
-        if not req.issubset(set(fixed["inputs"].keys())):
-            raise ValueError(f"IRR claim {fixed['id']} inputs must include {sorted(list(req))}")
+    # units default
+    if "units" not in fixed or not str(fixed["units"]).strip():
+        fixed["units"] = _default_units_for_claim(fixed["id"], fixed["type"], time_basis)
 
     return fixed
 
-def auto_repair_math_claims(claims_obj: dict, time_basis: str):
-    if not isinstance(claims_obj, dict):
+def auto_repair_math_claims(raw: dict, time_basis: str):
+    if not isinstance(raw, dict):
         return None, "Math Claims root is not an object"
-
-    claims = claims_obj.get("claims")
+    claims = raw.get("claims")
     if not isinstance(claims, list):
         return None, "Math Claims missing 'claims' list"
 
@@ -333,7 +329,7 @@ def auto_repair_math_claims(claims_obj: dict, time_basis: str):
                 else:
                     fixed["expected"] = float(val)
             except Exception as e:
-                return None, f"Could not compute expected for claim {fixed['id']}: {e}"
+                return None, f"Could not compute expected for {fixed['id']}: {e}"
 
         repaired["claims"].append(fixed)
 
@@ -344,7 +340,6 @@ def verify_math_claims(repaired: dict):
     for c in repaired.get("claims", []):
         cid = c.get("id", "")
         ctype = c.get("type")
-        inputs = c.get("inputs") or {}
         expected = c.get("expected", None)
         units = c.get("units", "")
 
@@ -364,16 +359,125 @@ def verify_math_claims(repaired: dict):
 
     return results
 
-def required_ids_present(repaired: dict):
+# ----------------------------
+# Universal semantic gates
+# ----------------------------
+def required_ids_gate(repaired: dict):
     ids = {c.get("id") for c in repaired.get("claims", [])}
-    missing = sorted(list(REQUIRED_CLAIM_IDS - ids))
-    return (len(missing) == 0), missing
+    missing = sorted(list(REQUIRED_IDS - ids))
+    if missing:
+        return False, f"Missing required claim IDs: {missing}"
+    return True, "OK"
 
-def math_gate_ok(text: str, time_basis: str):
+def required_contract_gate(repaired: dict, time_basis: str):
+    # Build map
+    cmap = {c["id"]: c for c in repaired.get("claims", []) if "id" in c}
+    for rid, spec in REQUIRED_CONTRACT.items():
+        c = cmap.get(rid)
+        if c is None:
+            return False, f"Missing required claim {rid}"
+        if c.get("type") != spec["type"]:
+            return False, f"Required claim {rid} must be type={spec['type']}, got {c.get('type')}"
+        # Units kind checks
+        units = (c.get("units") or "").lower()
+        if spec["units_kind"] == "usd":
+            if "usd" not in units or ("per_" in units):
+                # allow plain USD only
+                if units not in ("usd",):
+                    return False, f"Required claim {rid} must have units=USD, got {c.get('units')}"
+        if spec["units_kind"] == "pmt":
+            if time_basis == "annual" and "year" not in units:
+                return False, f"{rid} must be USD_per_year in annual mode, got {c.get('units')}"
+            if time_basis == "monthly" and "month" not in units:
+                return False, f"{rid} must be USD_per_month in monthly mode, got {c.get('units')}"
+            # PMT inputs coherence
+            inp = c.get("inputs") or {}
+            nper = int(inp.get("nper"))
+            rate = float(inp.get("rate"))
+            if time_basis == "annual":
+                if nper > 60:
+                    return False, f"{rid} nper={nper} looks monthly; annual mode expects years"
+                if rate <= 0 or rate > 1:
+                    return False, f"{rid} rate={rate} invalid for annual rate"
+            else:
+                if nper < 60:
+                    return False, f"{rid} nper={nper} looks annual; monthly mode expects months"
+                if rate <= 0 or rate > 1:
+                    return False, f"{rid} rate={rate} invalid"
+
+    return True, "OK"
+
+def scenario_balance_gate(repaired: dict, allocation_model: str, debt_ratio: float, equity_ratio: float, abs_tol_usd: float = 1_000_000.0):
+    """
+    Universal scenario gate using required claims:
+    - base_capex = base_debt + base_equity
+    - incremental_allocation:
+      A: debt_case_a = base_debt; equity_case_a = base_equity + overrun
+      B: debt_case_b = base_debt + debt_ratio*overrun; equity_case_b = base_equity + equity_ratio*overrun
+    - total_rebalance:
+      B: debt_case_b = debt_ratio*(base_capex+overrun); equity_case_b = equity_ratio*(base_capex+overrun)
+      A (debt capped) still: debt_case_a=base_debt; equity_case_a=base_equity+overrun
+    - capped_variable:
+      Must satisfy base_capex + overrun == debt_case_x + equity_case_x for both cases,
+      and at least one of (debt_case_a==base_debt) or (equity_case_a==base_equity) holds.
+    """
+    cmap = {c["id"]: c for c in repaired.get("claims", []) if "id" in c}
+    def v(cid):
+        return float(cmap[cid]["expected"])
+
+    base_debt = v("base_debt")
+    base_equity = v("base_equity")
+    overrun = v("capex_overrun")
+
+    debt_a = v("debt_case_a")
+    eq_a = v("equity_case_a")
+    debt_b = v("debt_case_b")
+    eq_b = v("equity_case_b")
+
+    base_capex = base_debt + base_equity
+    total_capex = base_capex + overrun
+
+    def close(a, b):
+        return abs(a - b) <= abs_tol_usd
+
+    # universal identity: both cases must fund total capex after overrun
+    if not close(debt_a + eq_a, total_capex):
+        return False, f"Scenario identity fails Case A: debt+equity={debt_a+eq_a} vs total_capex={total_capex}"
+    if not close(debt_b + eq_b, total_capex):
+        return False, f"Scenario identity fails Case B: debt+equity={debt_b+eq_b} vs total_capex={total_capex}"
+
+    if allocation_model == "incremental_allocation":
+        if not close(debt_a, base_debt):
+            return False, f"Case A debt must equal base_debt under incremental_allocation"
+        if not close(eq_a, base_equity + overrun):
+            return False, f"Case A equity must equal base_equity+overrun under incremental_allocation"
+        if not close(debt_b, base_debt + debt_ratio * overrun):
+            return False, f"Case B debt must equal base_debt + debt_ratio*overrun under incremental_allocation"
+        if not close(eq_b, base_equity + equity_ratio * overrun):
+            return False, f"Case B equity must equal base_equity + equity_ratio*overrun under incremental_allocation"
+
+    elif allocation_model == "total_rebalance":
+        if not close(debt_a, base_debt):
+            return False, f"Case A debt must equal base_debt under total_rebalance (debt capped case)"
+        if not close(eq_a, base_equity + overrun):
+            return False, f"Case A equity must equal base_equity+overrun under total_rebalance (debt capped case)"
+        if not close(debt_b, debt_ratio * total_capex):
+            return False, f"Case B debt must equal debt_ratio*total_capex under total_rebalance"
+        if not close(eq_b, equity_ratio * total_capex):
+            return False, f"Case B equity must equal equity_ratio*total_capex under total_rebalance"
+
+    else:  # capped_variable
+        if not (close(debt_a, base_debt) or close(eq_a, base_equity)):
+            return False, f"capped_variable requires either debt_case_a==base_debt or equity_case_a==base_equity"
+    return True, "OK"
+
+# ----------------------------
+# Math gate
+# ----------------------------
+def math_gate_ok(text: str, time_basis: str, allocation_model: str, debt_ratio: float, equity_ratio: float):
     block = extract_json_block(text)
     if not block:
         return False, "No fenced ```json``` block found in Math Claims section"
-
     block = strip_json_comments(block)
     try:
         raw = json.loads(block)
@@ -384,9 +488,17 @@ def math_gate_ok(text: str, time_basis: str):
     if err:
         return False, f"Math Claims auto-repair failed: {err}"
 
-    ok_ids, missing_ids = required_ids_present(repaired)
-    if not ok_ids:
-        return False, f"Missing required claim IDs: {missing_ids}"
+    ok, msg = required_ids_gate(repaired)
+    if not ok:
+        return False, msg
+
+    ok, msg = required_contract_gate(repaired, time_basis=time_basis)
+    if not ok:
+        return False, msg
+
+    ok, msg = scenario_balance_gate(repaired, allocation_model=allocation_model, debt_ratio=debt_ratio, equity_ratio=equity_ratio)
+    if not ok:
+        return False, msg
 
     results = verify_math_claims(repaired)
     for r in results:
@@ -394,12 +506,11 @@ def math_gate_ok(text: str, time_basis: str):
             return False, f"Math verifier error in {r['id']}: {r['error']}"
         if r["expected"] is not None and r["ok"] is False:
             return False, f"Math mismatch in {r['id']}"
-
     return True, results
 
-def render_math_table(text: str, title: str, time_basis: str):
+def render_math_table(text: str, title: str, time_basis: str, allocation_model: str, debt_ratio: float, equity_ratio: float):
     st.markdown(f"### Math Verification — {title}")
-    ok, info = math_gate_ok(text, time_basis=time_basis)
+    ok, info = math_gate_ok(text, time_basis=time_basis, allocation_model=allocation_model, debt_ratio=debt_ratio, equity_ratio=equity_ratio)
     if ok and isinstance(info, list):
         st.table(info)
         st.success("Math verified ✅")
@@ -430,8 +541,6 @@ def parse_blocking_items(text: str):
 # Model calls
 # ----------------------------
 def call_openai(model_name: str, system: str, user_text: str, temperature=0.2) -> str:
-    if not openai_client:
-        return "❌ OpenAI not configured"
     resp = openai_client.chat.completions.create(
         model=model_name,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user_text}],
@@ -440,8 +549,6 @@ def call_openai(model_name: str, system: str, user_text: str, temperature=0.2) -
     return resp.choices[0].message.content
 
 def call_claude(model_name: str, system: str, user_text: str) -> str:
-    if not anthropic_client:
-        return "❌ Claude not configured"
     msg = anthropic_client.messages.create(
         model=model_name,
         max_tokens=1600,
@@ -456,8 +563,6 @@ def call_claude(model_name: str, system: str, user_text: str) -> str:
     return out.strip()
 
 def call_grok(model_name: str, system: str, user_text: str) -> str:
-    if not XAI_API_KEY:
-        return "❌ Grok not configured"
     last_err = None
     for attempt in range(3):
         try:
@@ -480,7 +585,7 @@ def call_grok(model_name: str, system: str, user_text: str) -> str:
     return last_err or "❌ Grok Error: unknown"
 
 # ----------------------------
-# Leader selection UI
+# Leader UI
 # ----------------------------
 available_leaders = []
 if OPENAI_API_KEY:
@@ -512,12 +617,14 @@ def leader_call(system: str, user_text: str, temperature=0.2):
 # Universal controls
 # ----------------------------
 st.markdown("### Universal Controls")
-time_basis = st.selectbox("Time basis for periodic claims", ["annual", "monthly"], index=0)
-allocation_model = st.selectbox(
-    "Allocation model for shock/overrun scenarios",
-    ["incremental_allocation", "total_rebalance", "capped_variable"],
-    index=0,
-)
+time_basis = st.selectbox("Time basis for PMT claims", ["annual", "monthly"], index=0)
+allocation_model = st.selectbox("Allocation model", ["incremental_allocation", "total_rebalance", "capped_variable"], index=0)
+
+st.markdown("### Funding Ratios (universal)")
+debt_ratio = st.number_input("Debt ratio", min_value=0.0, max_value=1.0, value=0.60, step=0.01)
+equity_ratio = st.number_input("Equity ratio", min_value=0.0, max_value=1.0, value=0.40, step=0.01)
+if abs((debt_ratio + equity_ratio) - 1.0) > 1e-9:
+    st.warning("Debt ratio + Equity ratio should equal 1.0 for meaningful scenario checks.")
 
 # ----------------------------
 # Problem inputs
@@ -553,50 +660,37 @@ with colA:
 with colB:
     run_assume = st.button("Run ASSUMPTION")
 
-max_iters = st.slider("ASSUMPTION iterations", 2, 8, 4)
+max_iters = st.slider("ASSUMPTION iterations", 2, 10, 6)
 
 # ----------------------------
-# Master format
+# Prompt template
 # ----------------------------
 MASTER_FORMAT = "\n".join([
     "Return in this exact structure:",
-    "",
     "## Mode Banner",
-    "",
     "## Scenario Definitions (MANDATORY)",
     "- Time basis: must equal TIME_BASIS_SELECTED.",
     "- Allocation model: must equal ALLOCATION_MODEL_SELECTED.",
-    "- Define Case A and Case B explicitly using that allocation model.",
-    "",
+    "- Use DEBT_RATIO and EQUITY_RATIO provided.",
     "## Inputs Used (Verbatim)",
-    "- Bullet list key-value facts only.",
-    "",
     "## Assumptions Added by Master",
-    "",
     "## Executive Answer",
-    "",
     "## Calculations / Logic",
     "- No inline JSON. No code blocks except the final Math Claims block.",
-    "",
     "## Key Risks (ranked)",
-    "",
     "## Contract / Legal Checks",
-    "",
     "## Missing Inputs",
     "### Blocking",
     "### Non-blocking",
-    "",
     "## Claims Audit",
-    "",
     "## Math Claims (JSON)",
-    "Provide exactly ONE fenced JSON block with schema {\"claims\":[...]} and include ALL required claim IDs:",
-    f"{sorted(list(REQUIRED_CLAIM_IDS))}",
+    "Provide exactly ONE fenced JSON block with schema {\"claims\":[...]} that includes ALL required IDs:",
+    f"{sorted(list(REQUIRED_IDS))}",
     "",
-    "Each claim MUST be one of:",
-    "- arithmetic: needs expr + inputs + expected + units",
-    "- pmt: needs inputs rate,nper,pv + expected + units",
-    "",
-    "No 'B' or '%' symbols inside JSON numbers; use full numbers (e.g., 3200000000) or decimals (0.6).",
+    "Hard requirements for required IDs:",
+    "- base_debt/base_equity/capex_overrun/debt_case_a/equity_case_a/debt_case_b/equity_case_b must be arithmetic claims (type='arithmetic') with expr+inputs+expected+units='USD'.",
+    "- pmt_case_a/pmt_case_b must be pmt claims (type='pmt') with inputs rate,nper,pv and units matching TIME_BASIS_SELECTED.",
+    "- JSON numeric inputs must be plain numbers (no 'B', no '%', no expressions like 0.065/12).",
     "",
     "## Confidence",
 ])
@@ -605,14 +699,14 @@ MASTER_SYSTEM_STRICT = "\n".join([
     "You are Nemexis Master (STRICT).",
     "- Do NOT add numeric assumptions.",
     "- If blocking inputs exist, do NOT state threshold outcomes as likely; say cannot determine.",
-    "- Provide one fenced Math Claims JSON block with all required claim IDs and valid schema.",
+    "- Provide one fenced Math Claims JSON block meeting all required claim constraints.",
 ])
 
 MASTER_SYSTEM_ASSUME = "\n".join([
     "You are Nemexis Master (ASSUMPTION MODE).",
-    "- Use the Assumption Pack to fill missing values; tag each [Assumed].",
-    "- Provide one fenced Math Claims JSON block with ALL required claim IDs.",
-    "- Use full numbers in JSON (no 3.2B, no 60%).",
+    "- Use Assumption Pack to fill gaps; tag each [Assumed].",
+    "- Provide one fenced Math Claims JSON block meeting all required claim constraints.",
+    "- JSON numeric inputs must be plain numbers (no B, no %, no 0.065/12 expressions).",
     "- In ASSUMPTION mode, Blocking should be NONE unless truly impossible.",
 ])
 
@@ -630,6 +724,8 @@ def run_master_strict():
         "MODE: STRICT",
         f"TIME_BASIS_SELECTED: {time_basis}",
         f"ALLOCATION_MODEL_SELECTED: {allocation_model}",
+        f"DEBT_RATIO: {debt_ratio}",
+        f"EQUITY_RATIO: {equity_ratio}",
         "USER PROMPT:",
         txt,
         "OUTPUT FORMAT:",
@@ -643,6 +739,8 @@ def run_master_assume(feedback: str):
         "MODE: ASSUMPTION",
         f"TIME_BASIS_SELECTED: {time_basis}",
         f"ALLOCATION_MODEL_SELECTED: {allocation_model}",
+        f"DEBT_RATIO: {debt_ratio}",
+        f"EQUITY_RATIO: {equity_ratio}",
         "USER PROMPT:",
         txt,
         "ASSUMPTION PACK:",
@@ -668,17 +766,13 @@ if run_strict:
     if not user_prompt.strip():
         st.error("Please paste a prompt.")
         st.stop()
-
     st.divider()
     st.markdown("## STRICT Result")
     draft, fence_err = ensure_fenced_json(run_master_strict, max_tries=2)
     if fence_err:
         st.error(fence_err)
-    render_math_table(draft, "STRICT", time_basis=time_basis)
+    render_math_table(draft, "STRICT", time_basis=time_basis, allocation_model=allocation_model, debt_ratio=debt_ratio, equity_ratio=equity_ratio)
     st.write(draft)
-    blockers = parse_blocking_items(draft)
-    st.markdown("### Blocking inputs")
-    st.write(blockers if blockers else ["None"])
 
 # ----------------------------
 # ASSUMPTION iterative + best-valid + synthesis
@@ -709,10 +803,10 @@ if run_assume:
                 f"- Math failure reason: {prev['math_fail_reason']}",
                 "",
                 "Hard rules:",
-                "- Must include ALL required claim IDs in Math Claims JSON.",
-                "- JSON numbers must be plain numbers (no B, no %).",
-                "- PMT claims must use type='pmt' with inputs rate,nper,pv.",
-                "- In ASSUMPTION mode, Blocking should be NONE (fill gaps).",
+                "- Must include ALL required claim IDs with correct types/units.",
+                "- JSON numeric inputs must be plain numbers (no B, no %, no 0.065/12).",
+                "- Scenario balance must satisfy funding identity checks.",
+                "- In ASSUMPTION mode, Blocking should be NONE.",
             ])
 
         def draft_call():
@@ -724,7 +818,7 @@ if run_assume:
 
         st.write(draft)
 
-        ok_math, math_info = math_gate_ok(draft, time_basis=time_basis)
+        ok_math, math_info = math_gate_ok(draft, time_basis=time_basis, allocation_model=allocation_model, debt_ratio=debt_ratio, equity_ratio=equity_ratio)
         if ok_math:
             st.success("Math verified ✅")
             st.table(math_info)
@@ -772,7 +866,7 @@ if run_assume:
         "Rules:",
         "- Preserve Scenario Definitions exactly.",
         "- Do not introduce new numeric assumptions.",
-        "- Provide one fenced Math Claims JSON block including ALL required claim IDs.",
+        "- Provide one fenced Math Claims JSON block including ALL required IDs with correct types.",
         "- No other JSON or code blocks.",
     ])
 
@@ -809,7 +903,7 @@ if run_assume:
     for attempt in range(1, 3):
         with st.spinner(f"Synthesizing final memo (attempt {attempt})..."):
             memo = leader_call(SYNTH_SYSTEM, synth_input, temperature=0.2)
-        ok_math, math_info = math_gate_ok(memo, time_basis=time_basis)
+        ok_math, math_info = math_gate_ok(memo, time_basis=time_basis, allocation_model=allocation_model, debt_ratio=debt_ratio, equity_ratio=equity_ratio)
         if ok_math:
             final_memo = memo
             final_math_table = math_info
@@ -830,11 +924,13 @@ if run_assume:
     export_text = f"""# Nemexis Export
 Generated: {datetime.datetime.now()}
 Leader: {leader}
-Mode: ASSUMPTION + Final Synthesis (v10.3.2)
+Mode: ASSUMPTION + Final Synthesis (v10.3.4)
 
 ## UNIVERSAL CONTROLS
 Time basis: {time_basis}
 Allocation model: {allocation_model}
+Debt ratio: {debt_ratio}
+Equity ratio: {equity_ratio}
 
 ## USER PROMPT
 {user_prompt.strip()}

@@ -1,5 +1,1 @@
-streamlit
-openai
-anthropic
-requests
-simpleeval
+streamlit>=1.36.0

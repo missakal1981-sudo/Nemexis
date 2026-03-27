@@ -37,6 +37,13 @@ class DeterministicEngine:
         self.platform = platform
         self.platform.validate()
 
+    def compute_cfads(ebitda, tax_rate, reserves):
+    taxes = ebitda * tax_rate
+    reserve_amount = ebitda * reserves
+    return ebitda - taxes - reserve_amount
+    cfads = compute_cfads(total_ebitda, platform.tax_rate, platform.reserves)
+    
+
     def _annual_revenue_for_asset(self, asset: Asset) -> float:
         if asset.revenue_mode in ("tolling", "transmission"):
             return asset.capacity_mw * 1000.0 * asset.toll_usd_per_kw_month * 12.0 * asset.utilization

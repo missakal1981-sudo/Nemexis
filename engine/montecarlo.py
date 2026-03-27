@@ -17,6 +17,27 @@ def percentile(values: List[float], p: float):
     idx = int(round((len(values) - 1) * p))
     return values[idx]
 
+def run_monte_carlo(platform, n=10000):
+    irr_results = []
+    dscr_results = []
+
+    for _ in range(n):
+        p = platform.copy()
+
+        for a in p.assets:
+            a.revenue *= random.uniform(0.9, 1.1)
+            a.capex *= random.uniform(0.9, 1.2)
+
+        res = run_deterministic(p)
+
+        irr_results.append(res["equity_irr"])
+        dscr_results.append(res["dscr"])
+
+    return {
+        "irr_p50": percentile(irr_results, 50),
+        "irr_p90": percentile(irr_results, 90),
+        "dscr_p50": percentile(dscr_results, 50),
+    }
 
 class MonteCarloEngine:
     def __init__(self, platform: Platform, iterations: int = 10000, seed: int = 42):

@@ -26,7 +26,15 @@ def npv(rate: float, cashflows: Iterable[float]) -> float:
         total += cf / ((1 + rate) ** t)
     return total
 
-
+def irr(cashflows, guess=0.1):
+    rate = guess
+    for _ in range(100):
+        npv = sum(cf / ((1 + rate) ** i) for i, cf in enumerate(cashflows))
+        d_npv = sum(-i * cf / ((1 + rate) ** (i + 1)) for i, cf in enumerate(cashflows))
+        if abs(d_npv) < 1e-6:
+            break
+        rate -= npv / d_npv
+    return rate
 def irr_bisection(
     cashflows: List[float],
     low: float = -0.95,

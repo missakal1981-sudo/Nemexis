@@ -74,3 +74,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+if st.button("Run Downside"):
+    res_down = run_deterministic(apply_scenario(platform, "Downside"))
+
+if st.button("Run Sensitivity"):
+    sens = run_sensitivity(platform)
+    st.json(sens)
